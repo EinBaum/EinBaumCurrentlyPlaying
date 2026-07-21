@@ -1,0 +1,55 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// Half-resolution wash shadow term. One invocation per half-res texel reconstructs the card-plane
+// world point it covers (the wash receiver is the z=0 plane, so screen UV maps to world XY directly),
+// traces the key light and both tip lights, and stores the raw visibilities. The M_WASH fragment path
+// then bilinearly upsamples this instead of tracing per pixel. The shadow term is low-frequency (soft
+// penumbra, smooth tip pools), so the visible gradient survives the 2x downsample.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D outShadow;
+
+#include "shadow_common.glsl"   // Camera (set 1, binding 0), scene TLAS (set 2), death field, traceShadow
+
+const float KEY_SHADOW_HARDNESS = 0.85;
+const float KEY_SHADOW_RADIUS   = 0.03;
+
+// A tip light casts no shadow when it is off, the receiver is out of its range, or its gate is closed
+// while the light is still appearing; the fragment path early-outs identically there, so the stored
+// value is unused but kept at fully-lit. `gate` (0..1) fades the traced streak in. `inColumn` adds the
+// scrolling-line mask (0x04) so a marquee letter casts a tip shadow where its raster is, same as the key.
+float tipVisibility(vec3 P, vec3 N, vec4 light, vec4 color, float gate, bool inColumn) {
+    if (color.a <= 0.0 || gate <= 0.0) return 1.0;
+    vec3 toL = light.xyz - P;
+    if (length(toL) >= light.w) return 1.0;
+    vec3 sToL = vec3(light.xy, TIP_SHADOW_Z) - P;
+    float sDist = length(sToL);
+    uint mask = inColumn ? 0x05u : 0x01u;
+    float vis = traceShadow(P, N, sToL / max(sDist, 1e-4), sDist, mask, 1.0, TIP_SHADOW_RADIUS);
+    return mix(1.0, vis, gate);
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dim = imageSize(outShadow);
+    if (gid.x >= dim.x || gid.y >= dim.y) return;
+
+    // Texel centre in screen UV, then to the card-plane world point. The card maps edge-to-edge:
+    // worldX in [-1, 1] across u, worldY in [+halfH, -halfH] across v (screen y down, world y up).
+    vec2 uv = (vec2(gid) + 0.5) / vec2(dim);
+    float halfH = max(cam.params.y, 1e-4);
+    vec3 P = vec3(uv.x * 2.0 - 1.0, halfH * (1.0 - 2.0 * uv.y), 0.0);
+    vec3 N = vec3(0.0, 0.0, 1.0);
+
+    // A scrolling line (mask 0x04), title and/or artist, drifts past the column edges; its raster is
+    // scissored but its cast shadow is not, so it is shadowed only onto wash texels inside the column
+    // [params.z, params.w]. The shadow then tracks the visible part of each letter and is cut at the edges.
+    bool inColumn = cam.params.w > cam.params.z && P.x >= cam.params.z && P.x <= cam.params.w;
+    float keyVis = traceShadow(P, N, normalize(KEY_SHADOW_DIR), 2.0, 0x03u, KEY_SHADOW_HARDNESS, KEY_SHADOW_RADIUS);
+    if (inColumn)
+        keyVis = min(keyVis, traceShadow(P, N, normalize(KEY_SHADOW_DIR), 2.0, 0x04u, KEY_SHADOW_HARDNESS, KEY_SHADOW_RADIUS));
+    float tip1 = tipVisibility(P, N, cam.tipLight,  cam.tipColor,  cam.tipShadow.x, inColumn);
+    float tip2 = tipVisibility(P, N, cam.tipLight2, cam.tipColor2, cam.tipShadow.y, inColumn);
+    imageStore(outShadow, gid, vec4(keyVis, tip1, tip2, 1.0));
+}
