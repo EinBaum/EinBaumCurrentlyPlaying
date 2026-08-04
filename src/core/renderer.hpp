@@ -52,7 +52,12 @@ enum class Line : uint8_t { Title, Artist, Count };
 struct Marquee {
     bool active = false;
     bool armed = false;
-    bool dying = false;    // outgoing burning copy was scrolling, so keep clipping it through the burn
+    // Outgoing burning copy: it holds at the scroll offset the burn caught it at, column-clipped.
+    struct Burn {
+        bool on = false;
+        float shift = 0.0f;   // frozen scroll offset, world units
+        float period = 0.0f;  // width + gap at freeze time, world units
+    } burn;
     double start = 0.0;    // steady-clock seconds the scroll is measured from
     float width = 0.0f;    // laid line width, world units
     float gap = 0.0f;      // blank gap before the wrapped repeat, world units

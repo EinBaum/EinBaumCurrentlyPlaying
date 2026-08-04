@@ -275,8 +275,8 @@ float Renderer::armLine(Marquee& m, float laidW, float colW, float emWorld, floa
 }
 
 void Renderer::buildCurrent(const Track& t) {
-    // Keep dying: beginTextBurn latched it from the outgoing line before this runs.
-    for (Marquee& m : mq_) { bool dying = m.dying; m = Marquee{}; m.dying = dying; }
+    // Keep burn: beginTextBurn latched it from the outgoing line before this runs.
+    for (Marquee& m : mq_) { auto burn = m.burn; m = Marquee{}; m.burn = burn; }
     // The cover slot is reserved from the bytes alone so the layout stands before the decode lands;
     // an already-valid album_ (setTrack kept an identical cover) needs no decode.
     artWait_.reserved = !t.artPng.empty();
@@ -341,8 +341,18 @@ void Renderer::layoutText(const Track& t) {
 void Renderer::beginTextBurn(bool burnTitle, bool burnArtist) {
     outgoingTitleGlyphs_.clear();
     outgoingArtistGlyphs_.clear();
-    mq(Line::Title).dying  = burnTitle  && mq(Line::Title).active;
-    mq(Line::Artist).dying = burnArtist && mq(Line::Artist).active;
+    // Freeze the scroll where the last drawn frame left it (fpsLastSteady_ is that frame's clock).
+    auto latch = [&](Marquee& m, bool burning) {
+        m.burn = Marquee::Burn{};
+        if (!burning || !m.active) return;
+        m.burn.on = true;
+        m.burn.period = m.width + m.gap;
+        // An armed line has no latched start (never drawn), so it froze at offset zero.
+        double scroll = m.armed ? 0.0 : std::max(0.0, (fpsLastSteady_ - m.start) - MARQUEE_HOLD_SEC) * m.speed;
+        m.burn.shift = m.burn.period > 0.0f ? static_cast<float>(std::fmod(scroll, m.burn.period)) : 0.0f;
+    };
+    latch(mq(Line::Title), burnTitle);
+    latch(mq(Line::Artist), burnArtist);
     if (burnTitle)  outgoingTitleGlyphs_  = std::move(titleGlyphs_);
     if (burnArtist) outgoingArtistGlyphs_ = std::move(artistGlyphs_);
     titleGlyphs_.clear();  artistGlyphs_.clear();
@@ -474,7 +484,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
                 artWait_.reserved = false;
                 titleGlyphs_.clear();
                 artistGlyphs_.clear();
-                for (Marquee& m : mq_) { bool dying = m.dying; m = Marquee{}; m.dying = dying; }
+                for (Marquee& m : mq_) { auto burn = m.burn; m = Marquee{}; m.burn = burn; }
                 layoutText(currentTrack_);
             }
         }
@@ -639,7 +649,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
     // oblique shear at Z_TEXT so the cut aligns with the scissored letters, not the world edge.
     // Zeroed (w <= z) when nothing scrolls.
     const bool clipShadow = mq(Line::Title).active || mq(Line::Artist).active ||
-        (transitioning && (mq(Line::Title).dying || mq(Line::Artist).dying));
+        (transitioning && (mq(Line::Title).burn.on || mq(Line::Artist).burn.on));
     cam.params.z = clipShadow ? colLeft_ + OBLIQUE_X * Z_TEXT : 0.0f;
     cam.params.w = clipShadow ? colRight_ + OBLIQUE_X * Z_TEXT : 0.0f;
     // The incoming tip's cast shadow is gated to the new title's own materialization so the streak
@@ -739,8 +749,15 @@ void Renderer::draw(const Track& t, double nowSteady) {
         drawLine(artistGlyphs_, mq(Line::Artist), artistChanged_ ? newTextDissolve : 0.0f);
         if (transitioning) {
             vec4 outEmber{outgoingEmberAccent_.r, outgoingEmberAccent_.g, outgoingEmberAccent_.b, 1.0f};
-            addGlyphs(outgoingTitleGlyphs_, oldTextDissolve, outEmber, 0.0f, mq(Line::Title).dying);
-            addGlyphs(outgoingArtistGlyphs_, oldTextDissolve, outEmber, 0.0f, mq(Line::Artist).dying);
+            // A burning line that was scrolling holds its frozen offset; both wrapped copies stay
+            // clipped so whatever spanned the column keeps spanning it while it burns.
+            auto drawOutgoing = [&](const std::vector<GlyphInstance>& glyphs, const Marquee& m) {
+                if (!m.burn.on) { addGlyphs(glyphs, oldTextDissolve, outEmber); return; }
+                addGlyphs(glyphs, oldTextDissolve, outEmber, -m.burn.shift, true);
+                addGlyphs(glyphs, oldTextDissolve, outEmber, m.burn.period - m.burn.shift, true);
+            };
+            drawOutgoing(outgoingTitleGlyphs_, mq(Line::Title));
+            drawOutgoing(outgoingArtistGlyphs_, mq(Line::Artist));
         }
         // outgoing fill on the bar plane; incoming lifted by Z_FILL_OVER to own the shared span
         if (transitioning && outgoingTrack_.valid)
