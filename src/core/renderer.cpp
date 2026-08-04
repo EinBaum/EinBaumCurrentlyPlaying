@@ -274,13 +274,14 @@ float Renderer::armLine(Marquee& m, float laidW, float colW, float emWorld, floa
     return std::numeric_limits<float>::max();
 }
 
-void Renderer::buildCurrent(const Track& t) {
+void Renderer::buildCurrent(const Track& t, bool redecode) {
     // Keep burn: beginTextBurn latched it from the outgoing line before this runs.
     for (Marquee& m : mq_) { auto burn = m.burn; m = Marquee{}; m.burn = burn; }
     // The cover slot is reserved from the bytes alone so the layout stands before the decode lands;
-    // an already-valid album_ (setTrack kept an identical cover) needs no decode.
+    // an already-valid album_ (setTrack kept an identical cover) needs no decode unless the caller
+    // is replacing the shown cover with new bytes (redecode).
     artWait_.reserved = !t.artPng.empty();
-    if (artWait_.reserved && !album_.valid) {
+    if (artWait_.reserved && (redecode || !album_.valid)) {
         artWait_.seq = artDecoder_.submit(t.artPng, WIN_H);
         artWait_.pending = true;
     }
@@ -440,12 +441,19 @@ void Renderer::refreshArt(const Track& t) {
         pendingTrack_.queued = true;
         return;
     }
-    // album_ may still be bound by in-flight command buffers, so stall the GPU before destroying it.
-    vkDeviceWaitIdle(device_);
-    destroyTexture(album_);
+    // A cover replacing one held on screen mid-dissolve joins the running crossfade as its outgoing
+    // side; drawing the replacement outside the handoff would show it at full opacity mid-fade.
+    if (state_ == PlaybackState::Transitioning && sameCover_ && album_.valid && !outgoingAlbum_.valid) {
+        outgoingAlbum_ = album_;
+        album_ = Texture{};
+        outgoingWashDim_ = washDim_;
+        sameCover_ = false;
+        hasAlbumAccent_ = false;
+    }
+    // A still-valid album_ stays on screen until the replacement decode lands (swapped in draw), so
+    // the card never blanks for the decode's duration.
     titleGlyphs_.clear();  artistGlyphs_.clear();
-    hasAlbumAccent_ = false;
-    buildCurrent(t);
+    buildCurrent(t, true);
     currentTrack_ = t;
 }
 
@@ -470,17 +478,30 @@ float Renderer::advancePlayPauseFade(bool playing, double nowSteady) {
 }
 
 void Renderer::draw(const Track& t, double nowSteady) {
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    uint32_t idx = 0;
+    VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, semAcquire_, VK_NULL_HANDLE, &idx);
+    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { destroySwapchain(); createSwapchain(); return; }
+    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) vkCheck(acq);
+    vkResetFences(device_, 1, &fence_);
+
     // Land a finished cover decode; a result whose seq is stale (superseded submit) is dropped.
+    // Runs after the fence wait so a cover held on screen through the decode can be destroyed here:
+    // the last frame that sampled it has completed.
     if (artWait_.pending) {
         if (auto r = artDecoder_.take(); r && r->seq == artWait_.seq) {
             artWait_.pending = false;
             const DecodedImage& img = r->img;
-            if (img.w > 0 && !album_.valid) {
+            if (img.w > 0) {
+                destroyTexture(album_);
                 album_ = createTextureRGBA(img.rgba.data(), img.w, img.h, true);  // mips: the wash mip-taps for its blur
-                if (img.hasAccent) { albumAccent_ = {img.ar, img.ag, img.ab, 1.0f}; hasAlbumAccent_ = true; }
+                if (img.hasAccent) albumAccent_ = {img.ar, img.ag, img.ab, 1.0f};
+                hasAlbumAccent_ = img.hasAccent;
                 washDim_ = img.washDim;
-            } else if (img.w <= 0) {
+            } else {
                 // Undecodable cover: drop the reserved slot and re-lay the text at the coverless offset.
+                destroyTexture(album_);
+                hasAlbumAccent_ = false;
                 artWait_.reserved = false;
                 titleGlyphs_.clear();
                 artistGlyphs_.clear();
@@ -489,13 +510,6 @@ void Renderer::draw(const Track& t, double nowSteady) {
             }
         }
     }
-
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-    uint32_t idx = 0;
-    VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, semAcquire_, VK_NULL_HANDLE, &idx);
-    if (acq == VK_ERROR_OUT_OF_DATE_KHR) { destroySwapchain(); createSwapchain(); return; }
-    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) vkCheck(acq);
-    vkResetFences(device_, 1, &fence_);
 
     // Frame-rate EMA with the alpha derived from dt, so it converges in fixed wall-clock time
     // regardless of frame cadence.
@@ -520,7 +534,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
     if (state_ == PlaybackState::Transitioning && nowSteady - transitionStart_ >= TRANSITION_SEC) {
         state_ = PlaybackState::Active;
         // Safe to free the outgoing wash: the fence wait above ordered the last frame to sample it,
-        // and this frame will not reference it (crossBlur is false once state_ leaves Transitioning).
+        // and this frame will not reference it (the handoff draws only while state_ is Transitioning).
         destroyTexture(outgoingAlbum_);
         outgoingTitleGlyphs_.clear();
         outgoingArtistGlyphs_.clear();
@@ -552,7 +566,6 @@ void Renderer::draw(const Track& t, double nowSteady) {
 
     const bool transitioning = state_ == PlaybackState::Transitioning;
     const float blurIn = fillIn;
-    const bool crossBlur = transitioning && outgoingAlbum_.valid;
 
     // The bar, playhead, tip light, and play/pause mix read the on-screen song. During a buffered
     // transition the draw argument t is the pending song (not yet shown); reading it would drive
@@ -664,14 +677,20 @@ void Renderer::draw(const Track& t, double nowSteady) {
     auto addCard = [&](const Track& tk, Texture& album) {
         const mat4 washQuad = quadModel(0, 0, WIN_W, WIN_H, Z_CARD, 0.0f);
         const mat4 coverQuad = quadModel(0, 0, WIN_H, WIN_H, Z_ALBUM, 0.0f);
-        // An unchanged cover (same album) is held static; only a different cover crossfades.
-        const bool coverHandoff = crossBlur && !sameCover_;
+        // An unchanged cover (same album) is held static; only a different cover crossfades. The
+        // incoming side animates on every such dissolve, even from a coverless song, so a cover
+        // never lands at full opacity mid-fade.
+        const bool coverFade = transitioning && !sameCover_;
+        const bool coverHandoff = coverFade && outgoingAlbum_.valid;
 
-        // Drawn first so the incoming wash composites over it under LESS_OR_EQUAL at the shared Z_CARD.
+        // Drawn first so the incoming wash composites over it under LESS_OR_EQUAL at the shared
+        // Z_CARD; a coverless outgoing song contributes its flat card background instead.
         if (coverHandoff)
             items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {1, 1, 1, 1}, .fade = 1.0f, .mode = MeshMode::Wash, .occluder = false, .tex = outgoingAlbum_.dset, .washDim = outgoingWashDim_});
+        else if (coverFade)
+            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {CARD_BG.r, CARD_BG.g, CARD_BG.b, 1.0f}, .fade = 1.0f, .mode = MeshMode::Lit, .occluder = false, .tex = white_.dset});
         if (album.valid)
-            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {1, 1, 1, 1}, .fade = coverHandoff ? blurIn : 1.0f, .mode = MeshMode::Wash, .occluder = false, .tex = album.dset, .washDim = washDim_});
+            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {1, 1, 1, 1}, .fade = coverFade ? blurIn : 1.0f, .mode = MeshMode::Wash, .occluder = false, .tex = album.dset, .washDim = washDim_});
         else
             items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {CARD_BG.r, CARD_BG.g, CARD_BG.b, 1.0f}, .fade = blurIn, .mode = MeshMode::Lit, .occluder = false, .tex = white_.dset});
         // The outgoing cover clears over the first half and the incoming over the second, so the
@@ -683,7 +702,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
         }
         if (album.valid)
             items.push_back({.mesh = &unitQuad_, .model = coverQuad, .color = {1, 1, 1, 1},
-                             .fade = coverHandoff ? (1.0f - newTextDissolve / DISSOLVE_END) : 1.0f, .mode = MeshMode::Flat, .occluder = false, .tex = album.dset});
+                             .fade = coverFade ? (1.0f - newTextDissolve / DISSOLVE_END) : 1.0f, .mode = MeshMode::Flat, .occluder = false, .tex = album.dset});
         if (tk.duration > 0.0 || tk.live) {
             // Unfilled groove: the rod's centre is lifted one radius off Z_BAR so it sits in front
             // of the card rather than sinking into it. Sized by the reserved cover slot so the bar

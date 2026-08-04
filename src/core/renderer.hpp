@@ -300,7 +300,7 @@ private:
                     float emWorld, float penX, float baselineY, float z, vec4 color, float maxX);
     [[nodiscard]] float measureLine(const FontFace& f, const std::wstring& s, float emWorld);
     [[nodiscard]] float armLine(Marquee& m, float laidW, float colW, float emWorld, float maxX);
-    void buildCurrent(const Track& t);
+    void buildCurrent(const Track& t, bool redecode = false);
     void layoutText(const Track& t);
     void beginTextBurn(bool burnTitle, bool burnArtist);
     float advancePlayPauseFade(bool playing, double nowSteady);
