@@ -4,7 +4,7 @@
 // into world space, so any 5:1 on-screen window renders this same composition.
 constexpr int WIN_W = 2400, WIN_H = 480;
 // On-screen / swapchain window, same 5:1 aspect as the reference space.
-constexpr int WINDOW_W = 1000, WINDOW_H = 200;
+constexpr int WINDOW_W = 800, WINDOW_H = 160;
 constexpr int EDGE_GAP = 5;
 constexpr int PAD = 66;         // cover->text left offset (WIN_H + PAD) and right margin (WIN_W - PAD)
 constexpr int PAD_TOP = 30;
