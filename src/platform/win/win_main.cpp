@@ -1,4 +1,4 @@
-// Windows entry point: parses --debug, creates the overlay window, and hands control to runApp.
+// Windows entry point: parses --debug/--http, creates the overlay window, and hands control to runApp.
 #include "core/app.hpp"
 #include "core/fatal.hpp"
 #include "core/theme.hpp"
@@ -9,10 +9,10 @@
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR lpCmdLine, int) {
     installCrashHandler();
 
-    // --debug only shows the fps readout.
     const std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
     const bool debug = cmdLine.find(L"--debug") != std::wstring::npos;
+    const bool http = cmdLine.find(L"--http") != std::wstring::npos;
 
     std::unique_ptr<PlatformWindow> window = createPlatformWindow(WINDOW_W, WINDOW_H);
-    return runApp(*window, debug);
+    return runApp(*window, debug, http);
 }

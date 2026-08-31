@@ -1,4 +1,5 @@
-// Linux entry point: parses --debug, creates the Wayland overlay window, and hands control to runApp.
+// Linux entry point: parses --debug/--http, creates the Wayland overlay window, and hands control
+// to runApp.
 #include "core/app.hpp"
 #include "core/fatal.hpp"
 #include "core/theme.hpp"
@@ -10,8 +11,12 @@ int main(int argc, char** argv) {
     installCrashHandler();
 
     bool debug = false;
-    for (int i = 1; i < argc; ++i)
-        if (std::string_view(argv[i]) == "--debug") debug = true;
+    bool http = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--debug") debug = true;
+        else if (a == "--http") http = true;
+    }
     std::unique_ptr<PlatformWindow> window = createPlatformWindow(WINDOW_W, WINDOW_H);
-    return runApp(*window, debug);
+    return runApp(*window, debug, http);
 }

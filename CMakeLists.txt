@@ -47,11 +47,21 @@ foreach(entry ${SHADERS})
 endforeach()
 add_custom_target(shaders DEPENDS ${SHADER_INLS})
 
+# --- Vendored cJSON (third_party/cjson): static lib so the HTTP API does not hand-roll JSON --------
+add_library(json STATIC ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(json PUBLIC ${CMAKE_SOURCE_DIR}/third_party/cjson)
+# Static link: do not dllexport. CJSON_HIDE_SYMBOLS is the cJSON-supported static-lib switch.
+target_compile_definitions(json PUBLIC CJSON_HIDE_SYMBOLS)
+if(NOT WIN32)
+    target_link_libraries(json PUBLIC m)
+endif()
+
 # --- Portable core (src/core: Vulkan renderer + math + layout + glyph tessellation + app loop) -------
 add_library(core STATIC
     ${SRC}/core/app.cpp
     ${SRC}/core/art_decoder.cpp
     ${SRC}/core/glyph_mesh.cpp
+    ${SRC}/core/http_api.cpp
     ${SRC}/core/image.cpp
     ${SRC}/core/renderer.cpp
     ${SRC}/core/renderer_raytracing.cpp
@@ -62,7 +72,11 @@ add_dependencies(core shaders)
 target_include_directories(core PUBLIC ${SRC} ${CMAKE_BINARY_DIR})
 
 find_package(Vulkan REQUIRED)
-target_link_libraries(core PUBLIC Vulkan::Vulkan)
+target_link_libraries(core PUBLIC Vulkan::Vulkan json)
+if(WIN32)
+    # LocalHttpApi uses Winsock (ws2_32 is an OS import lib; the rest of core stays Vulkan-only).
+    target_link_libraries(core PUBLIC ws2_32)
+endif()
 
 # --- Platform layer + entry point --------------------------------------------------------------------
 if(WIN32)

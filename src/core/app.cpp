@@ -1,6 +1,7 @@
-// The OS-agnostic application core: media polling, redraw-cadence math, and the main loop. The
-// platform entry points create a PlatformWindow and call runApp.
+// The OS-agnostic application core: media polling, redraw-cadence math, the localhost JSON API,
+// and the main loop. The platform entry points create a PlatformWindow and call runApp.
 #include "core/app.hpp"
+#include "core/http_api.hpp"
 #include "core/media.hpp"
 #include "core/renderer.hpp"
 #include "platform/platform.hpp"
@@ -16,6 +17,7 @@ namespace {
 
 Renderer g_renderer;
 MediaPoller g_poller;
+LocalHttpApi g_api;
 bool g_inited = false;
 Track g_track;
 uint64_t g_lastSeq = std::numeric_limits<uint64_t>::max();
@@ -69,11 +71,12 @@ constexpr double KEEP_LAST_SEC = 10.0;
 
 }  // namespace
 
-int runApp(PlatformWindow& window, bool debug) {
+int runApp(PlatformWindow& window, bool debug, bool http) {
     g_renderer.init(window);
     g_renderer.setShowFps(debug);
     g_inited = true;
     g_poller.start();
+    if (http) g_api.start(g_poller);
 
     window.show();
 
@@ -144,6 +147,7 @@ int runApp(PlatformWindow& window, bool debug) {
         window.waitEvents(timeoutMs);
     }
     window.clearTaskbarArt();
+    g_api.stop();
     g_poller.stop();
     g_renderer.shutdown();
     return 0;
