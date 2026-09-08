@@ -234,66 +234,6 @@ Texture Renderer::createTextureRGBA(const uint8_t* rgba, int w, int h, bool mips
     vkCheck(vkCreateImage(device_, &ici, nullptr, &t.image));
     allocBindImageMemory(t.image, t.mem);
 
-    submitNow([&](VkCommandBuffer cb) {
-        VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        br.srcQueueFamilyIndex = br.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        br.image = t.image;
-        br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
-        br.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        br.srcAccessMask = 0;
-        br.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &br);
-        VkBufferImageCopy region{};
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1};
-        vkCmdCopyBufferToImage(cb, staging, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-        int32_t mw = w, mh = h;
-        for (uint32_t i = 1; i < mipLevels; ++i) {
-            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = t.image;
-            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1};
-            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &b);
-            int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
-            VkImageBlit blit{};
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
-            blit.srcOffsets[1] = {mw, mh, 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
-            blit.dstOffsets[1] = {nw, nh, 1};
-            vkCmdBlitImage(cb, t.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-            mw = nw; mh = nh;
-        }
-
-        // To SHADER_READ_ONLY: levels 0..n-2 are TRANSFER_SRC, the last is TRANSFER_DST.
-        if (mipLevels > 1) {
-            br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels - 1, 0, 1};
-            br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            br.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            br.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            br.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &br);
-        }
-        br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1, 0, 1};
-        br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        br.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        br.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        br.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 1, &br);
-    });
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, stagingMem, nullptr);
-
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = t.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -316,7 +256,75 @@ Texture Renderer::createTextureRGBA(const uint8_t* rgba, int w, int h, bool mips
     vkUpdateDescriptorSets(device_, 1, &wds, 0, nullptr);
 
     t.valid = true;
+
+    // Queue the staging copy for the frame command buffer; init-time callers that lack a frame CB
+    // will flush pendingUploads_ synchronously via submitNow before returning from init().
+    pendingUploads_.push_back({staging, stagingMem, t.image, mipLevels, w, h});
+
     return t;
+}
+
+// Record the buffer→image copy and mip-gen barriers into the given command buffer.  The staging
+// resources are moved to inFlightStagings_ and freed after the next fence wait.
+void Renderer::recordTextureUpload(VkCommandBuffer cb, Texture& /*t*/, StagedUpload& su) {
+    VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    br.srcQueueFamilyIndex = br.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    br.image = su.image;
+    br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, su.mipLevels, 0, 1};
+    br.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    br.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    br.srcAccessMask = 0;
+    br.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &br);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {static_cast<uint32_t>(su.w), static_cast<uint32_t>(su.h), 1};
+    vkCmdCopyBufferToImage(cb, su.staging, su.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    int32_t mw = su.w, mh = su.h;
+    for (uint32_t i = 1; i < su.mipLevels; ++i) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = su.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1};
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &b);
+        int32_t nw = mw > 1 ? mw / 2 : 1, nh = mh > 1 ? mh / 2 : 1;
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+        blit.srcOffsets[1] = {mw, mh, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        blit.dstOffsets[1] = {nw, nh, 1};
+        vkCmdBlitImage(cb, su.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       su.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        mw = nw; mh = nh;
+    }
+
+    // To SHADER_READ_ONLY: levels 0..n-2 are TRANSFER_SRC, the last is TRANSFER_DST.
+    if (su.mipLevels > 1) {
+        br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, su.mipLevels - 1, 0, 1};
+        br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        br.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        br.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        br.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &br);
+    }
+    br.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, su.mipLevels - 1, 1, 0, 1};
+    br.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    br.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    br.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    br.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &br);
+
+    inFlightStagings_.push_back(su);
+    su = StagedUpload{};  // ownership transferred
 }
 
 void Renderer::destroyTexture(Texture& t) {
@@ -326,6 +334,13 @@ void Renderer::destroyTexture(Texture& t) {
     if (t.image) vkDestroyImage(device_, t.image, nullptr);
     if (t.mem) vkFreeMemory(device_, t.mem, nullptr);
     t = Texture{};
+}
+
+// Queue a texture for destruction after the next fence wait, avoiding vkDeviceWaitIdle.
+void Renderer::deferDestroyTexture(Texture& t) {
+    if (!t.valid) return;
+    pendingDestroyTextures_.push_back(t);
+    t = Texture{};  // caller no longer owns the handles
 }
 
 // Host-visible vertex + index buffers: the meshes are tiny and static once built, so mapped

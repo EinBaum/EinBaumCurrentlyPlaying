@@ -22,6 +22,17 @@ struct Texture {
     bool valid = false;
 };
 
+// A staging buffer and mip count recorded by createTextureRGBA but not yet submitted to the GPU.
+// recordTextureUpload() records the copy + mip-gen into a command buffer; the staging resources
+// are freed after the next fence wait.
+struct StagedUpload {
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    uint32_t mipLevels = 1;
+    int w = 0, h = 0;
+};
+
 struct Mesh {
     VkBuffer vbo = VK_NULL_HANDLE, ibo = VK_NULL_HANDLE;
     VkDeviceMemory vboMem = VK_NULL_HANDLE, iboMem = VK_NULL_HANDLE;
@@ -204,6 +215,16 @@ private:
     ArtDecoder artDecoder_;
     ArtWait artWait_;
 
+    // Textures whose destruction is deferred to the next fence wait, so setTrack() can hand off
+    // textures without a vkDeviceWaitIdle.
+    std::vector<Texture> pendingDestroyTextures_;
+
+    // Staged texture uploads awaiting recording into the frame command buffer.
+    std::vector<StagedUpload> pendingUploads_;
+    // Staging resources whose GPU work has been recorded but not yet completed; freed after the
+    // next fence wait.
+    std::vector<StagedUpload> inFlightStagings_;
+
     // Cross-dissolve song slots. outgoing* is the song dissolving away; currentTrack_ the song
     // dissolving in and then shown; pendingTrack_ the latest change requested mid-dissolve
     // (overwritten by each further change, so a fast-skip burst collapses to the final song) and
@@ -281,7 +302,9 @@ private:
     void allocBindImageMemory(VkImage image, VkDeviceMemory& mem);
     void submitNow(const std::function<void(VkCommandBuffer)>& rec);
     [[nodiscard]] Texture createTextureRGBA(const uint8_t* rgba, int w, int h, bool mips = false);
+    void recordTextureUpload(VkCommandBuffer cb, Texture& t, StagedUpload& su);
     void destroyTexture(Texture& t);
+    void deferDestroyTexture(Texture& t);
     [[nodiscard]] Mesh createMesh(const std::vector<Vertex3>& verts, const std::vector<uint32_t>& indices);
     void destroyMesh(Mesh& m);
 
@@ -290,6 +313,7 @@ private:
     void ensureMeshBlas(Mesh& m);
     void prepareMeshBlas(Mesh& m);
     void flushPendingBlas();
+    void flushPendingBlas(VkCommandBuffer cb);
     void initSceneTlas();
     void buildSceneTlas(VkCommandBuffer cb, const std::vector<VkAccelerationStructureInstanceKHR>& insts);
     [[nodiscard]] VkDeviceAddress bufferAddr(VkBuffer b) const;
