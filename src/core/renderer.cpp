@@ -199,6 +199,15 @@ void Renderer::init(PlatformWindow& window) {
     // 1x1 white texture: solid (untextured) elements bind this and carry colour in the push constant.
     std::array<uint8_t, 4> whitePx{255, 255, 255, 255};
     white_ = createTextureRGBA(whitePx.data(), 1, 1);
+    // No frame command buffer exists yet; flush the staged upload synchronously.
+    for (StagedUpload& su : pendingUploads_)
+        submitNow([&](VkCommandBuffer cb) { recordTextureUpload(cb, white_, su); });
+    pendingUploads_.clear();
+    for (StagedUpload& su : inFlightStagings_) {
+        vkDestroyBuffer(device_, su.staging, nullptr);
+        vkFreeMemory(device_, su.stagingMem, nullptr);
+    }
+    inFlightStagings_.clear();
 
     // uv (0,1) at the bottom-left so the album cover samples upright.
     std::vector<Vertex3> qv = {
@@ -335,8 +344,8 @@ void Renderer::layoutText(const Track& t) {
         const float lim = armLine(mq(Line::Artist), artistW, colW, emWorld, maxX);
         layoutLine(artistGlyphs_, t.artist, *fontArtist_, emWorld, penX0, baselineY, Z_TEXT, artistCol, lim);
     }
-    // Build every BLAS the layout queued in one submit, rather than one stall per glyph.
-    flushPendingBlas();
+    // BLAS builds queued by glyphGpuMesh are flushed in draw() into the frame command buffer,
+    // rather than stalling the queue here.
 }
 
 void Renderer::beginTextBurn(bool burnTitle, bool burnArtist) {
@@ -370,7 +379,8 @@ void Renderer::setTrack(const Track& t) {
         return;
     }
 
-    vkDeviceWaitIdle(device_);
+    // No GPU drain: deferred texture destruction avoids the need for vkDeviceWaitIdle.
+    // The fence wait at draw()'s top orders the last frame that sampled any handed-off texture.
 
     if (!t.valid) {
         // Media cleared. The card-to-key transition is a hard cut: drop everything with no fade.
@@ -378,8 +388,8 @@ void Renderer::setTrack(const Track& t) {
         pendingTrack_.queued = false;
         for (Marquee& m : mq_) m = Marquee{};
         outgoingTitleGlyphs_.clear();  outgoingArtistGlyphs_.clear();
-        destroyTexture(outgoingAlbum_);
-        destroyTexture(album_);
+        deferDestroyTexture(outgoingAlbum_);
+        deferDestroyTexture(album_);
         titleGlyphs_.clear();       artistGlyphs_.clear();
         hasAlbumAccent_ = false;
         artWait_ = ArtWait{};
@@ -403,7 +413,7 @@ void Renderer::setTrack(const Track& t) {
     // Hand the outgoing wash over so the new song's wash fades in over it. An identical cover skips
     // the handoff and stays bound: draw never samples outgoingAlbum_ when sameCover_, and
     // re-decoding would blank the cover until the async result lands.
-    destroyTexture(outgoingAlbum_);
+    deferDestroyTexture(outgoingAlbum_);
     if (!sameCover_) {
         outgoingAlbum_ = album_;
         album_ = Texture{};
@@ -479,6 +489,17 @@ float Renderer::advancePlayPauseFade(bool playing, double nowSteady) {
 
 void Renderer::draw(const Track& t, double nowSteady) {
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+
+    // The fence signals that the last submitted frame completed: safe to free textures and staging
+    // buffers that were handed off mid-frame.
+    for (Texture& tex : pendingDestroyTextures_) destroyTexture(tex);
+    pendingDestroyTextures_.clear();
+    for (StagedUpload& su : inFlightStagings_) {
+        vkDestroyBuffer(device_, su.staging, nullptr);
+        vkFreeMemory(device_, su.stagingMem, nullptr);
+    }
+    inFlightStagings_.clear();
+
     uint32_t idx = 0;
     VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, semAcquire_, VK_NULL_HANDLE, &idx);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) { destroySwapchain(); createSwapchain(); return; }
@@ -819,8 +840,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
         drawDebugLine(std::format(L"{} fps", fps), 0);
         // The wash darkening only applies when a cover backs the wash; a coverless card is Lit.
         if (album_.valid) drawDebugLine(std::format(L"dim {:.3f}", washDim_), 1);
-        // A first-seen fps digit queues its BLAS in glyphGpuMesh; no buildCurrent follows here to flush it.
-        flushPendingBlas();
+        // A first-seen fps digit queues its BLAS in glyphGpuMesh; flushed below with the frame CB.
     }
 
     std::vector<VkAccelerationStructureInstanceKHR> insts;
@@ -846,6 +866,14 @@ void Renderer::draw(const Track& t, double nowSteady) {
     vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cb, &bi);
+
+    // Pipeline any pending texture uploads into this frame's command buffer.
+    for (StagedUpload& su : pendingUploads_)
+        recordTextureUpload(cb, album_, su);  // album_ is the only runtime texture; the reference is unused
+    pendingUploads_.clear();
+
+    // Pipeline pending BLAS builds into this frame's command buffer.
+    flushPendingBlas(cb);
 
     // The TLAS is a pure function of the occluder instances, so an unchanged set leaves the prior
     // build valid; the fence wait at draw's top already ordered the last build's reads.
@@ -982,6 +1010,18 @@ void Renderer::shutdown() {
     if (!device_) return;
     artDecoder_.stop();
     vkDeviceWaitIdle(device_);
+    for (Texture& tex : pendingDestroyTextures_) destroyTexture(tex);
+    pendingDestroyTextures_.clear();
+    for (StagedUpload& su : pendingUploads_) {
+        vkDestroyBuffer(device_, su.staging, nullptr);
+        vkFreeMemory(device_, su.stagingMem, nullptr);
+    }
+    pendingUploads_.clear();
+    for (StagedUpload& su : inFlightStagings_) {
+        vkDestroyBuffer(device_, su.staging, nullptr);
+        vkFreeMemory(device_, su.stagingMem, nullptr);
+    }
+    inFlightStagings_.clear();
     destroyTexture(white_);
     destroyTexture(album_);
     destroyTexture(outgoingAlbum_);
