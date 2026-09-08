@@ -69,9 +69,20 @@ void Renderer::prepareMeshBlas(Mesh& m) {
     pendingBlas_.push_back(p);
 }
 
-// Synchronous flush: records into a one-shot command buffer and stalls the queue.  Used only during
-// init() for the rod's eager BLAS build.
+// Init-only: one-shot CB + queue idle so the rod BLAS exists before the first frame.
 void Renderer::flushPendingBlas() {
+    if (pendingBlas_.empty()) return;
+    submitNow([&](VkCommandBuffer cb) { flushPendingBlas(cb); });
+    for (GpuScratch& s : inFlightBlasScratch_) {
+        vkDestroyBuffer(device_, s.buf, nullptr);
+        vkFreeMemory(device_, s.mem, nullptr);
+    }
+    inFlightBlasScratch_.clear();
+}
+
+// Record queued BLAS builds into cb. Barrier so a later TLAS build in this CB sees them.
+// Scratch stays alive until the frame fence (one in-flight frame).
+void Renderer::flushPendingBlas(VkCommandBuffer cb) {
     if (pendingBlas_.empty()) return;
     const uint32_t n = static_cast<uint32_t>(pendingBlas_.size());
     std::vector<VkAccelerationStructureBuildGeometryInfoKHR> bgis;
@@ -85,35 +96,8 @@ void Renderer::flushPendingBlas() {
     }
     for (const VkAccelerationStructureBuildRangeInfoKHR& r : ranges) pRanges.push_back(&r);
 
-    submitNow([&](VkCommandBuffer cb) { pfnCmdBuildAS_(cb, n, bgis.data(), pRanges.data()); });
-
-    for (PendingBlas& p : pendingBlas_) {
-        vkDestroyBuffer(device_, p.scratch, nullptr);
-        vkFreeMemory(device_, p.scratchMem, nullptr);
-    }
-    pendingBlas_.clear();
-}
-
-// Pipelined flush: records the BLAS builds into the caller's command buffer and appends a memory
-// barrier so the results are visible to a subsequent TLAS build in the same submit.  Scratch
-// buffers are deferred to inFlightStagings_ and freed after the next fence wait.
-void Renderer::flushPendingBlas(VkCommandBuffer cb) {
-    if (pendingBlas_.empty()) return;
-    const uint32_t n = static_cast<uint32_t>(pendingBlas_.size());
-    std::vector<VkAccelerationStructureBuildGeometryInfoKHR> bgis;
-    std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
-    std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> pRanges;
-    bgis.reserve(n); ranges.reserve(n); pRanges.reserve(n);
-    for (PendingBlas& p : pendingBlas_) {
-        p.bgi.pGeometries = &p.geom;
-        bgis.push_back(p.bgi);
-        ranges.push_back({.primitiveCount = p.primCount});
-    }
-    for (const VkAccelerationStructureBuildRangeInfoKHR& r : ranges) pRanges.push_back(&r);
-
     pfnCmdBuildAS_(cb, n, bgis.data(), pRanges.data());
 
-    // Barrier: BLAS writes must be visible before the TLAS build that follows in this CB.
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     mb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
@@ -121,9 +105,8 @@ void Renderer::flushPendingBlas(VkCommandBuffer cb) {
                          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                          0, 1, &mb, 0, nullptr, 0, nullptr);
 
-    // Defer scratch cleanup — the GPU is still using these buffers until the frame's fence signals.
     for (PendingBlas& p : pendingBlas_)
-        inFlightStagings_.push_back({p.scratch, p.scratchMem, VK_NULL_HANDLE, 0, 0, 0});
+        inFlightBlasScratch_.push_back({p.scratch, p.scratchMem});
     pendingBlas_.clear();
 }
 

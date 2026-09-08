@@ -266,7 +266,7 @@ Texture Renderer::createTextureRGBA(const uint8_t* rgba, int w, int h, bool mips
 
 // Record the buffer→image copy and mip-gen barriers into the given command buffer.  The staging
 // resources are moved to inFlightStagings_ and freed after the next fence wait.
-void Renderer::recordTextureUpload(VkCommandBuffer cb, Texture& /*t*/, StagedUpload& su) {
+void Renderer::recordTextureUpload(VkCommandBuffer cb, StagedUpload& su) {
     VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     br.srcQueueFamilyIndex = br.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     br.image = su.image;

@@ -181,6 +181,12 @@ private:
         VkDeviceMemory scratchMem = VK_NULL_HANDLE;
     };
     std::vector<PendingBlas> pendingBlas_;
+    // Scratch from flushPendingBlas(cb); freed after the frame fence (one in-flight frame).
+    struct GpuScratch {
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+    };
+    std::vector<GpuScratch> inFlightBlasScratch_;
 
     // VK_KHR_acceleration_structure entry points, resolved at runtime by loadRayTracingFns.
     PFN_vkGetBufferDeviceAddressKHR pfnGetBufferDeviceAddress_ = nullptr;
@@ -302,7 +308,7 @@ private:
     void allocBindImageMemory(VkImage image, VkDeviceMemory& mem);
     void submitNow(const std::function<void(VkCommandBuffer)>& rec);
     [[nodiscard]] Texture createTextureRGBA(const uint8_t* rgba, int w, int h, bool mips = false);
-    void recordTextureUpload(VkCommandBuffer cb, Texture& t, StagedUpload& su);
+    void recordTextureUpload(VkCommandBuffer cb, StagedUpload& su);
     void destroyTexture(Texture& t);
     void deferDestroyTexture(Texture& t);
     [[nodiscard]] Mesh createMesh(const std::vector<Vertex3>& verts, const std::vector<uint32_t>& indices);
