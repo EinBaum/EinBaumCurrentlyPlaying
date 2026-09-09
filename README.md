@@ -1,8 +1,7 @@
 # EinBaumCurrentlyPlaying
 
 Borderless "now playing" overlay for OBS, drawn with Vulkan. Shows album cover, title, artist, and
-progress bar on a green chroma-key card. The card is a small 3D scene: extruded letters, a
-progress-bar rod, and soft wash-plane shadows (rasterized projections, not ray-traced).
+progress bar on a green chroma-key card.
 
 ![screenshot](screenshot.jpg)
 
