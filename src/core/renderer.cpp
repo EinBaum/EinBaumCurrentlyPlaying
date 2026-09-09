@@ -1,5 +1,5 @@
 // Scene composition and per-track state: text layout, the song-change state machine, and draw().
-// Vulkan plumbing lives in renderer_vk.cpp, acceleration structures in renderer_raytracing.cpp.
+// Vulkan plumbing lives in renderer_vk.cpp.
 #include "core/renderer.hpp"
 #include "core/renderer_internal.hpp"
 #include "core/glyph_mesh.hpp"
@@ -33,10 +33,6 @@ constexpr double PLAY_FADE_SEC = 0.5;
 constexpr double TEXT_DISSOLVE_SEC = 1.5;
 constexpr float DISSOLVE_END = 1.05f;
 
-// Fixed-point scale packing a dissolving glyph's progress into its 24-bit TLAS instance custom
-// index (matches DISS_ENC in shadow_common.glsl); DISSOLVE_END * 2^20 stays well under 2^24.
-constexpr float DISS_ENCODE = static_cast<float>(1u << 20);
-
 // A line too long for its column holds left-aligned for MARQUEE_HOLD_SEC (> TRANSITION_SEC, so a
 // new line is solid before it moves), then drifts left at MARQUEE_EM_PER_SEC of its own em-widths
 // per second, wrapping with a MARQUEE_GAP_EM blank gap.
@@ -44,14 +40,10 @@ constexpr double MARQUEE_HOLD_SEC = 4.5;
 constexpr float MARQUEE_EM_PER_SEC = 0.512f;
 constexpr float MARQUEE_GAP_EM = 2.0f;
 
-// Ray-tracing occluder masks: the key light traces text and rod, the tip light only text (it sits
-// on the rod), and the wash shadow pass clips marquee-text shadows to the column.
-constexpr uint32_t MASK_TEXT = 0x01;
-constexpr uint32_t MASK_ROD = 0x02;
-constexpr uint32_t MASK_MARQUEE_TEXT = 0x04;
-
-// `occluder` items are instanced into the scene TLAS so they cast ray-traced shadows; the flat
-// receivers (card wash, album) are not.
+// `occluder` items are projected onto the card plane for the wash-shadow pass; the flat
+// receivers (card wash, album) are not. The key light includes the groove (`rod`); the tip
+// light skips it (the light sits on the rod). Marquee glyphs set `clipColumn` so both the
+// colour pass and the shadow pass scissor to the text column.
 struct DrawItem {
     const Mesh* mesh;
     mat4 model;
@@ -59,6 +51,7 @@ struct DrawItem {
     float fade;
     MeshMode mode;
     bool occluder;
+    bool rod = false;         // groove: key-light shadow only
     VkDescriptorSet tex;
     bool tess = false;
     float tessLevel = 0.0f;
@@ -68,17 +61,8 @@ struct DrawItem {
     float barLen = 0.0f;      // bar fill only: the rod's world length, sizing the tip in fixed world units
     float liveBar = 0.0f;     // bar fill only: >0 = live stream, glows uniformly with no playhead tip
     float washDim = 1.0f;     // wash only: per-cover darkening factor for the blurred background
-    uint32_t mask = MASK_TEXT;
     bool clipColumn = false;  // scissor the raster to the text column (a scrolling marquee line)
 };
-
-// Column-major mat4 -> the row-major 3x4 affine an acceleration-structure instance expects.
-[[nodiscard]] VkTransformMatrixKHR toVkTransform(const mat4& m) {
-    VkTransformMatrixKHR t;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 4; ++c) t.matrix[r][c] = m.at(c, r);
-    return t;
-}
 
 // The card maps to a rectangle 2 units wide on the z=0 plane at the window's aspect. worldX/worldY
 // map a pixel (origin top-left, y down) into it (origin centre, y up); both axes share one scale
@@ -222,16 +206,12 @@ void Renderer::init(PlatformWindow& window) {
     auto [cv, ci] = makeCylinder(28);
     barRod_ = createMesh(cv, ci);
 
+    // Occ render pass before the swapchain so the first wash-shadow images can attach a framebuffer.
+    createWashOccPass();
     createSwapchain();
 
-    loadRayTracingFns();
-    // The rod is present every frame, so build its BLAS eagerly; glyph BLASes are queued as
-    // letters first appear and built together per track change.
-    ensureMeshBlas(barRod_);
-    initSceneTlas();
     makeMeshPipeline();
-    // After the camera/TLAS sets exist: build the shadow compute pipeline and point its
-    // descriptors at the image createSwapchain already made.
+    makeShadowPipeline();
     makeWashShadowPipeline();
     writeWashShadowDescriptors();
 }
@@ -248,7 +228,6 @@ GpuGlyph Renderer::glyphGpuMesh(const FontFace& f, uint32_t cp) {
     advanceCache_[key] = g.advance;
     if (g.empty()) return {nullptr, g.advance};
     auto ins = glyphCache_.emplace(key, createMesh(g.verts, g.indices)).first;
-    prepareMeshBlas(ins->second);
     return {&ins->second, g.advance};
 }
 
@@ -485,8 +464,8 @@ float Renderer::advancePlayPauseFade(bool playing, double nowSteady) {
 void Renderer::draw(const Track& t, double nowSteady) {
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
 
-    // The fence signals that the last submitted frame completed: safe to free textures, staging
-    // buffers, and BLAS scratch that were handed off mid-frame.
+    // The fence signals that the last submitted frame completed: safe to free textures and staging
+    // buffers that were handed off mid-frame.
     for (Texture& tex : pendingDestroyTextures_) destroyTexture(tex);
     pendingDestroyTextures_.clear();
     for (StagedUpload& su : inFlightStagings_) {
@@ -494,11 +473,6 @@ void Renderer::draw(const Track& t, double nowSteady) {
         vkFreeMemory(device_, su.stagingMem, nullptr);
     }
     inFlightStagings_.clear();
-    for (GpuScratch& s : inFlightBlasScratch_) {
-        vkDestroyBuffer(device_, s.buf, nullptr);
-        vkFreeMemory(device_, s.mem, nullptr);
-    }
-    inFlightBlasScratch_.clear();
 
     uint32_t idx = 0;
     VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, semAcquire_, VK_NULL_HANDLE, &idx);
@@ -631,7 +605,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
     const float playMix = onScreen.valid ? advancePlayPauseFade(onScreen.playing, nowSteady) : playFade_;
 
     // Orthographic projection with the oblique depth shear layered in. Only the projection is
-    // oblique: world-space lighting and ray-traced shadows are unaffected.
+    // oblique: world-space lighting and planar projected shadows are unaffected.
     mat4 shear;                                  // x' = x + OBLIQUE_X*z; y' = y + OBLIQUE_Y*z
     shear.at(2, 0) = OBLIQUE_X;
     shear.at(2, 1) = OBLIQUE_Y;
@@ -679,21 +653,14 @@ void Renderer::draw(const Track& t, double nowSteady) {
         float intensity = TIP_LIGHT_INTENSITY * (outgoingTrack_.playing ? 1.0f : PAUSED_TIP_SCALE) * outFade;
         placeTip(cam.tipLight2, cam.tipColor2, outgoingTrack_, outgoingHadAlbum_, c, outLive, intensity);
     }
-    // params.zw: the shared text column for the wash shadow pass's marquee clip, shifted by the
-    // oblique shear at Z_TEXT so the cut aligns with the scissored letters, not the world edge.
-    // Zeroed (w <= z) when nothing scrolls.
-    const bool clipShadow = mq(Line::Title).active || mq(Line::Artist).active ||
-        (transitioning && (mq(Line::Title).burn.on || mq(Line::Artist).burn.on));
-    cam.params.z = clipShadow ? colLeft_ + OBLIQUE_X * Z_TEXT : 0.0f;
-    cam.params.w = clipShadow ? colRight_ + OBLIQUE_X * Z_TEXT : 0.0f;
     // The incoming tip's cast shadow is gated to the new title's own materialization so the streak
     // appears only once the geometry it shadows is the incoming title, not the outgoing one still
     // burning over the first half.
     cam.tipShadow = {1.0f - newTextDissolve / DISSOLVE_END, 1.0f, 0.0f, 0.0f};
     std::memcpy(camUboMapped_, &cam, sizeof(cam));
 
-    // Collect the scene on the CPU first so the occluders can be gathered into the acceleration
-    // structure before the render pass records its draws.
+    // Collect the scene on the CPU first so the occluders can be projected into the wash-shadow
+    // target before the main render pass records its draws.
     std::vector<DrawItem> items;
     auto addCard = [&](const Track& tk, Texture& album) {
         const mat4 washQuad = quadModel(0, 0, WIN_W, WIN_H, Z_CARD, 0.0f);
@@ -733,14 +700,13 @@ void Renderer::draw(const Track& t, double nowSteady) {
                              .model = translate({bar.leftXw, bar.cyW, Z_BAR + bar.radius}) *
                                       scale({bar.rightXw - bar.leftXw, bar.radius, bar.radius}),
                              .color = {TRACK_FG.r, TRACK_FG.g, TRACK_FG.b, 1.0f}, .fade = 1.0f, .mode = MeshMode::Lit,
-                             .occluder = true, .tex = white_.dset, .tess = true, .tessLevel = 3.0f, .mask = MASK_ROD});
+                             .occluder = true, .rod = true, .tex = white_.dset, .tess = true, .tessLevel = 3.0f});
         }
     };
 
-    // Letters cast ray-traced shadows. A dissolving letter stays in the occluder set: its TLAS
-    // instance carries the dissolve progress so the shadow ray erodes the cast shadow against the
-    // same death field. A marquee glyph goes on MASK_MARQUEE_TEXT: the wash shadow pass traces it
-    // separately and discards the cast shadow outside the column, matching the scissored raster.
+    // Letters cast projected shadows. A dissolving letter stays in the occluder set: the shadow
+    // fragment discards against the same death field so the cast shadow erodes with the glyph.
+    // A marquee glyph sets clipColumn so the wash-shadow pass scissors it to the column.
     auto addGlyphs = [&](const std::vector<GlyphInstance>& glyphs, float dissolve, vec4 ember,
                          float penShift = 0.0f, bool clip = false) {
         for (const GlyphInstance& gi : glyphs) {
@@ -748,8 +714,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
             items.push_back({.mesh = gi.mesh,
                              .model = translate({sx, gi.pos.y, gi.pos.z}) * scale(gi.scale),
                              .color = gi.color, .fade = 1.0f, .mode = MeshMode::Lit, .occluder = true, .tex = white_.dset,
-                             .dissolve = dissolve, .dissolveColor = ember,
-                             .mask = clip ? MASK_MARQUEE_TEXT : MASK_TEXT, .clipColumn = clip});
+                             .dissolve = dissolve, .dissolveColor = ember, .clipColumn = clip});
         }
     };
 
@@ -842,25 +807,6 @@ void Renderer::draw(const Track& t, double nowSteady) {
         if (album_.valid) drawDebugLine(std::format(L"dim {:.3f}", washDim_), 1);
     }
 
-    std::vector<VkAccelerationStructureInstanceKHR> insts;
-    insts.reserve(items.size());
-    for (const DrawItem& it : items) {
-        if (!it.occluder || !it.mesh->blas) continue;
-        VkAccelerationStructureInstanceKHR inst{};
-        inst.transform = toVkTransform(it.model);
-        inst.mask = it.mask;
-        inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        // A dissolving letter is forced non-opaque and carries its dissolve progress in the custom
-        // index, so the shadow ray's any-hit test erodes the cast shadow against the death field;
-        // solid occluders stay opaque and skip that test.
-        if (it.dissolve > 0.0f) {
-            inst.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
-            inst.instanceCustomIndex = static_cast<uint32_t>(it.dissolve * DISS_ENCODE) & 0xFFFFFFu;
-        }
-        inst.accelerationStructureReference = it.mesh->blasAddr;
-        insts.push_back(inst);
-    }
-
     VkCommandBuffer cb = cmds_[idx];
     vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -870,24 +816,75 @@ void Renderer::draw(const Track& t, double nowSteady) {
         recordTextureUpload(cb, su);
     pendingUploads_.clear();
 
-    flushPendingBlas(cb);
+    constexpr VkShaderStageFlags pushStages = VK_SHADER_STAGE_VERTEX_BIT |
+        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
+        VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    // The TLAS is a pure function of the occluder instances, so an unchanged set leaves the prior
-    // build valid; the fence wait at draw's top already ordered the last build's reads.
-    const bool occludersChanged = !tlasBuilt_ || !std::ranges::equal(insts, lastBuiltInsts_,
-        [](const VkAccelerationStructureInstanceKHR& a, const VkAccelerationStructureInstanceKHR& b) {
-            return std::memcmp(&a, &b, sizeof a) == 0;
-        });
-    if (occludersChanged) {
-        buildSceneTlas(cb, insts);
-        lastBuiltInsts_ = insts;
-        tlasBuilt_ = true;
-    }
-
-    // Only a card frame samples the wash shadow, so dispatch only when drawCard.
+    // Only a card frame samples the wash shadow, so project occluders and filter only then.
     if (drawCard) {
+        VkClearValue occClear{};
+        occClear.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
+        VkRenderPassBeginInfo sbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        sbi.renderPass = washOccPass_;
+        sbi.framebuffer = washOccFb_;
+        sbi.renderArea.extent = washShadowExtent_;
+        sbi.clearValueCount = 1;
+        sbi.pClearValues = &occClear;
+        vkCmdBeginRenderPass(cb, &sbi, VK_SUBPASS_CONTENTS_INLINE);
+
+        const float ww = static_cast<float>(washShadowExtent_.width);
+        VkViewport svpt{0, 0, ww, static_cast<float>(washShadowExtent_.height), 0, 1};
+        VkRect2D ssc{{0, 0}, washShadowExtent_};
+        vkCmdSetViewport(cb, 0, 1, &svpt);
+        vkCmdSetScissor(cb, 0, 1, &ssc);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeLayout_, 0, 1, &camSet_, 0, nullptr);
+
+        // Column clip in wash UV: world x without the camera's oblique shear, compared to the
+        // sheared letter edges so the cut lines up with the scissored raster.
+        auto washEdgePx = [&](float worldXv) {
+            return (worldXv / CARD_HALF_W * 0.5f + 0.5f) * ww;
+        };
+        const int sColL = std::clamp(static_cast<int>(std::floor(washEdgePx(colLeft_ + OBLIQUE_X * Z_TEXT))),
+                                     0, static_cast<int>(washShadowExtent_.width));
+        const int sColR = std::clamp(static_cast<int>(std::ceil(washEdgePx(colRight_ + OBLIQUE_X * Z_TEXT))),
+                                     sColL, static_cast<int>(washShadowExtent_.width));
+        VkRect2D sColSc{{sColL, 0}, {static_cast<uint32_t>(sColR - sColL), washShadowExtent_.height}};
+
+        auto drawOcc = [&](int lightMode, bool includeRod) {
+            bool colScissor = false;
+            VkPipeline bound = VK_NULL_HANDLE;
+            vkCmdSetScissor(cb, 0, 1, &ssc);
+            for (const DrawItem& it : items) {
+                if (!it.occluder || it.mesh->indexCount == 0) continue;
+                if (it.rod && !includeRod) continue;
+                if (it.clipColumn != colScissor) {
+                    vkCmdSetScissor(cb, 0, 1, it.clipColumn ? &sColSc : &ssc);
+                    colScissor = it.clipColumn;
+                }
+                VkPipeline want = it.tess ? shadowTessPipeline_ : shadowPipeline_;
+                if (want != bound) {
+                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+                    bound = want;
+                }
+                MeshPush pc{};
+                pc.model = it.model;
+                pc.mode = lightMode;
+                pc.tessLevel = it.tessLevel;
+                pc.dissolve = it.dissolve;
+                vkCmdPushConstants(cb, shadowPipeLayout_, pushStages, 0, sizeof(pc), &pc);
+                VkDeviceSize off = 0;
+                vkCmdBindVertexBuffers(cb, 0, 1, &it.mesh->vbo, &off);
+                vkCmdBindIndexBuffer(cb, it.mesh->ibo, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, it.mesh->indexCount, 1, 0, 0, 0);
+            }
+        };
+        drawOcc(0, true);
+        if (cam.tipColor.w > 0.0f && cam.tipShadow.x > 0.0f) drawOcc(1, false);
+        if (cam.tipColor2.w > 0.0f && cam.tipShadow.y > 0.0f) drawOcc(2, false);
+        vkCmdEndRenderPass(cb);
+
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, washShadowPipeline_);
-        std::array<VkDescriptorSet, 3> washSets{washStoreSet_, camSet_, sceneAsSet_};
+        std::array<VkDescriptorSet, 2> washSets{washStoreSet_, camSet_};
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, washShadowPipeLayout_, 0,
                                 static_cast<uint32_t>(washSets.size()), washSets.data(), 0, nullptr);
         vkCmdDispatch(cb, (washShadowExtent_.width + 7) / 8, (washShadowExtent_.height + 7) / 8, 1);
@@ -933,14 +930,9 @@ void Renderer::draw(const Track& t, double nowSteady) {
     int colR = std::clamp(static_cast<int>(std::ceil(colEdgePx(colRight_))), colL, static_cast<int>(extent_.width));
     VkRect2D colSc{{colL, 0}, {static_cast<uint32_t>(colR - colL), extent_.height}};
     bool colScissor = false;
-    // set 1 (camera) and set 2 (scene TLAS) are bound once: both pipelines share meshPipeLayout_,
-    // so switching between the flat and tessellated pipelines leaves them in place.
+    // set 1 (camera) is bound once: both pipelines share meshPipeLayout_, so switching between the
+    // flat and tessellated pipelines leaves it in place.
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeLayout_, 1, 1, &camSet_, 0, nullptr);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeLayout_, 2, 1, &sceneAsSet_, 0, nullptr);
-
-    constexpr VkShaderStageFlags pushStages = VK_SHADER_STAGE_VERTEX_BIT |
-        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
-        VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSet boundTex = VK_NULL_HANDLE;
     VkPipeline boundPipe = VK_NULL_HANDLE;
     for (const DrawItem& it : items) {
@@ -1019,16 +1011,6 @@ void Renderer::shutdown() {
         vkFreeMemory(device_, su.stagingMem, nullptr);
     }
     inFlightStagings_.clear();
-    for (PendingBlas& p : pendingBlas_) {
-        vkDestroyBuffer(device_, p.scratch, nullptr);
-        vkFreeMemory(device_, p.scratchMem, nullptr);
-    }
-    pendingBlas_.clear();
-    for (GpuScratch& s : inFlightBlasScratch_) {
-        vkDestroyBuffer(device_, s.buf, nullptr);
-        vkFreeMemory(device_, s.mem, nullptr);
-    }
-    inFlightBlasScratch_.clear();
     destroyTexture(white_);
     destroyTexture(album_);
     destroyTexture(outgoingAlbum_);
@@ -1042,23 +1024,22 @@ void Renderer::shutdown() {
     if (meshPipeline_) vkDestroyPipeline(device_, meshPipeline_, nullptr);
     if (tessPipeline_) vkDestroyPipeline(device_, tessPipeline_, nullptr);
     if (meshPipeLayout_) vkDestroyPipelineLayout(device_, meshPipeLayout_, nullptr);
+    if (shadowPipeline_) vkDestroyPipeline(device_, shadowPipeline_, nullptr);
+    if (shadowTessPipeline_) vkDestroyPipeline(device_, shadowTessPipeline_, nullptr);
+    if (shadowPipeLayout_) vkDestroyPipelineLayout(device_, shadowPipeLayout_, nullptr);
     if (washShadowPipeline_) vkDestroyPipeline(device_, washShadowPipeline_, nullptr);
     if (washShadowPipeLayout_) vkDestroyPipelineLayout(device_, washShadowPipeLayout_, nullptr);
     if (washStorePool_) vkDestroyDescriptorPool(device_, washStorePool_, nullptr);
     if (washStoreLayout_) vkDestroyDescriptorSetLayout(device_, washStoreLayout_, nullptr);
     if (washSampler_) vkDestroySampler(device_, washSampler_, nullptr);
+    if (washOccSampler_) vkDestroySampler(device_, washOccSampler_, nullptr);
     if (camPool_) vkDestroyDescriptorPool(device_, camPool_, nullptr);
     if (camLayout_) vkDestroyDescriptorSetLayout(device_, camLayout_, nullptr);
-    if (sceneInstMapped_) vkUnmapMemory(device_, sceneInstMem_);
-    if (sceneTlas_) pfnDestroyAS_(device_, sceneTlas_, nullptr);
-    for (VkBuffer b : {sceneTlasBuf_, sceneInstBuf_, sceneScratchBuf_}) if (b) vkDestroyBuffer(device_, b, nullptr);
-    for (VkDeviceMemory m : {sceneTlasMem_, sceneInstMem_, sceneScratchMem_}) if (m) vkFreeMemory(device_, m, nullptr);
-    if (sceneAsPool_) vkDestroyDescriptorPool(device_, sceneAsPool_, nullptr);
-    if (sceneAsLayout_) vkDestroyDescriptorSetLayout(device_, sceneAsLayout_, nullptr);
     if (sampler_) vkDestroySampler(device_, sampler_, nullptr);
     if (dsetPool_) vkDestroyDescriptorPool(device_, dsetPool_, nullptr);
     if (dsetLayout_) vkDestroyDescriptorSetLayout(device_, dsetLayout_, nullptr);
     destroySwapchain();
+    if (washOccPass_) vkDestroyRenderPass(device_, washOccPass_, nullptr);
     if (semAcquire_) vkDestroySemaphore(device_, semAcquire_, nullptr);
     if (semRender_) vkDestroySemaphore(device_, semRender_, nullptr);
     if (fence_) vkDestroyFence(device_, fence_, nullptr);

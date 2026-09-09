@@ -1,5 +1,6 @@
-// Shared between the renderer translation units (renderer.cpp, renderer_vk.cpp,
-// renderer_raytracing.cpp): the Vulkan result check and the GPU-facing data blocks.
+// Shared between the renderer translation units (renderer.cpp, renderer_vk.cpp): the Vulkan
+// result check and the GPU-facing data blocks. CameraUBO / MeshPush must match the GLSL
+// Camera block in shadow_common.glsl and the PC blocks in the mesh and shadow shaders.
 #pragma once
 #include <vulkan/vulkan.h>
 #include <cstdint>
@@ -16,7 +17,7 @@ enum class MeshMode : int32_t { Lit = 0, Wash = 1, Bar = 2, Flat = 3 };
 struct CameraUBO {
     mat4 viewProj;
     vec4 camPos;
-    vec4 params;     // x = card aspect (W/H); y = card world half-height; zw = marquee shadow-clip column
+    vec4 params;     // x = card aspect (W/H); y = card world half-height; zw unused (std140 padding)
     vec4 tipLight;   // progress-bar tip point light: xyz = world position, w = range (0 = off)
     vec4 tipColor;   // tip light: rgb = colour, a = intensity
     vec4 tipLight2;  // second tip point light: the outgoing playhead during a song change
@@ -24,8 +25,10 @@ struct CameraUBO {
     vec4 tipShadow;  // x = tipLight cast-shadow gate, y = tipLight2 gate (0 = casts no shadow)
 };
 
-// Push constant for the 3D mesh pipeline (128 B). Matches mesh.vert/mesh.tesc/mesh.tese/mesh.frag;
-// the earlier stages declare a shorter prefix of this block, which the shared layout permits.
+// Push constant for the mesh and shadow pipelines (128 B). Matches the PC blocks in
+// mesh.vert/mesh.tesc/mesh.tese/mesh.frag and the shadow shaders; earlier stages declare a
+// shorter prefix of this block, which the shared layout permits. In the shadow pass, `mode`
+// selects the light (0 = key, 1/2 = tip) rather than MeshMode.
 struct MeshPush {
     mat4 model;
     vec4 color;

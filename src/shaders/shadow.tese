@@ -1,15 +1,16 @@
 #version 460
 
-// Phong-smoothed rod. Keep the interpolation identical to shadow.tese so the groove's cast
-// shadow matches the rounded silhouette.
+// Phong-smoothed rod, then projected onto the card plane. Same smoothing as mesh.tese so the
+// groove's cast shadow matches the rounded silhouette rather than the coarse control cage.
 
 layout(triangles, equal_spacing, ccw) in;
+
+#define CAM_SET 0
+#include "shadow_common.glsl"
 
 layout(location = 0) in vec3 tcNormal[];
 layout(location = 1) in vec2 tcUV[];
 layout(location = 2) in vec3 tcWorld[];
-
-#include "shadow_common.glsl"   // Camera (set 1, binding 0)
 
 layout(push_constant) uniform PC {
     mat4 model;
@@ -47,5 +48,5 @@ void main() {
     vNormal = n;
     vUV = uv;
     vWorld = pos;
-    gl_Position = cam.viewProj * vec4(pos, 1.0);
+    gl_Position = projectToWashClip(pos, pc.mode);
 }

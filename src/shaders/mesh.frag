@@ -1,5 +1,4 @@
 #version 460
-#extension GL_EXT_ray_query : require
 
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in vec2 vUV;
@@ -9,7 +8,7 @@ layout(set = 0, binding = 0) uniform sampler2D tex;
 // Half-res key/tip shadow visibilities from wash_shadow.comp: R = key, G = tip light 1, B = tip light 2.
 layout(set = 1, binding = 1) uniform sampler2D washShadow;
 
-#include "shadow_common.glsl"   // Camera (set 1, binding 0), scene TLAS (set 2), death field, traceShadow
+#include "shadow_common.glsl"   // Camera (set 1, binding 0), death field, key/tip light constants
 
 layout(push_constant) uniform PC {
     mat4 model;
@@ -33,16 +32,17 @@ const int M_BAR  = 2;
 const int M_FLAT = 3;
 
 // How strongly the key light's cast shadow darkens the card: 0 leaves it fully lit, 1 applies the full
-// traceShadow depth.
-const float KEY_SHADOW_STRENGTH = 0.95;
+// filtered-occlusion depth.
+const float KEY_SHADOW_STRENGTH = 1.0;
 
 // How strongly the tip light's cast shadow removes the playhead glow: 0 leaves the pool fully lit, 1
-// applies the full traceShadow depth. At TIP_SHADOW_STRENGTH the deepest streak keeps 1 - TIP_SHADOW_STRENGTH of the added glow.
-const float TIP_SHADOW_STRENGTH = 0.81;
+// applies the full filtered-occlusion depth. At TIP_SHADOW_STRENGTH the deepest streak keeps 1 - TIP_SHADOW_STRENGTH of the added glow.
+const float TIP_SHADOW_STRENGTH = 0.90;
 
-// How far the cast streak dims the bare wash beneath it, on top of removing the glow: 0 only subtracts
-// the added light, 1 drives the streak to black. Scaled by the light's reach so it fades with the pool.
-const float TIP_SHADOW_DARKEN = 0.6;
+// How far the tip's own letter-streak dims the bare wash, on top of removing the glow. Kept modest:
+// the projected tip silhouette slides with the playhead, and a strong wash dim looks like letter
+// shadows crawling. Scaled by the light's reach so it fades with the pool.
+const float TIP_SHADOW_DARKEN = 0.45;
 
 float ditherHash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
 
@@ -64,14 +64,12 @@ vec3 blurWash(vec2 uv, float dim) {
 
 // Progress-bar tip light: a coloured point light with a smooth distance falloff to zero at its range.
 // When `shadowed`, `shVis` is the cast-shadow visibility toward the light (the half-res buffer sampled
-// by the caller), turned into the glow attenuation `sh`; the rod is excluded from that trace since the
-// light sits on it. `washOcc` dims the bare wash where a letter blocks the streak; `fill` is the
-// strength delivered here after its own shadow, which M_WASH uses to delete the key shadow. M_LIT passes
-// shadowed = false: the letter faces are frontmost, so nothing can fall between them and a light in
-// front of them. A dark light (intensity 0 or out of range) returns before using `shVis`.
-vec3 tipLight(vec3 P, vec3 N, vec3 V, vec3 albedo, bool shadowed, float shVis, vec4 light, vec4 color, out float washOcc, out float fill) {
+// by the caller), turned into the glow attenuation `sh`; the rod is left out of the tip occluder set
+// since the light sits on it. `washOcc` dims the bare wash where a letter blocks the streak. M_LIT
+// passes shadowed = false: the letter faces are frontmost, so nothing can fall between them and a light
+// in front of them. A dark light (intensity 0 or out of range) returns before using `shVis`.
+vec3 tipLight(vec3 P, vec3 N, vec3 V, vec3 albedo, bool shadowed, float shVis, vec4 light, vec4 color, out float washOcc) {
     washOcc = 1.0;
-    fill = 0.0;
     float range = light.w, intensity = color.a;
     vec3 toL = light.xyz - P;
     float dist = length(toL);
@@ -84,9 +82,6 @@ vec3 tipLight(vec3 P, vec3 N, vec3 V, vec3 albedo, bool shadowed, float shVis, v
         sh = mix(1.0, shVis, TIP_SHADOW_STRENGTH);
         washOcc = mix(1.0, sh, TIP_SHADOW_DARKEN * at);
     }
-    // Multiplying by sh drives fill to 0 inside the tip's own streak, so a self-shadowed point does not
-    // fill the key shadow.
-    fill = intensity * at * sh;
     float diff = max(dot(N, L), 0.0);
     float spec = pow(max(dot(N, normalize(L + V)), 0.0), 28.0);
     return color.rgb * (intensity * at * sh) * (albedo * diff + vec3(spec * 0.12));
@@ -107,10 +102,7 @@ void main() {
     // band still ahead of the front glows.
     vec3 emberAdd = vec3(0.0);
     if (pc.dissolve > 0.0) {
-        float halfH = max(cam.params.y, 1e-4);
-        float rise = clamp((vWorld.y + halfH) / (2.0 * halfH), 0.0, 1.0);
-        float death = mix(dissolveField(vWorld.xy), rise, 0.3);
-        float edge = death - pc.dissolve;
+        float edge = dissolveDeath(vWorld) - pc.dissolve;
         if (edge <= 0.0) discard;
         float ember = 1.0 - clamp(edge / 0.13, 0.0, 1.0);
         emberAdd = mix(pc.dissolveColor.rgb, vec3(1.0), ember * ember) * ember * 2.0;
@@ -119,16 +111,15 @@ void main() {
     if (pc.mode == M_WASH) {
         vec3 w = blurWash(vUV, pc.washDim);
         // The wash quad covers the full window at z=0, so vUV is the screen UV: it indexes the half-res
-        // shadow buffer at the same world point wash_shadow.comp traced. R = key, G/B = the tip lights.
+        // shadow buffer at the same world point wash_shadow.comp filtered. R = key, G/B = the tip lights.
         vec3 vis = texture(washShadow, vUV).rgb;
         vec3 Vw = normalize(cam.camPos.xyz - vWorld);
-        float occ1, occ2, fill1, fill2;
-        vec3 glow  = tipLight(vWorld, N, Vw, vec3(0.8), true, vis.g, cam.tipLight,  cam.tipColor,  occ1, fill1);
-        glow      += tipLight(vWorld, N, Vw, vec3(0.8), true, vis.b, cam.tipLight2, cam.tipColor2, occ2, fill2);
-        // The tip pool floods out the key shadow beneath it: a shadow is only the absence of one light.
-        float tipFill = clamp(max(fill1, fill2), 0.0, 1.0);
-        float keyShadow = mix(1.0, vis.r, KEY_SHADOW_STRENGTH);
-        w *= mix(keyShadow, 1.0, tipFill);
+        float occ1, occ2;
+        vec3 glow  = tipLight(vWorld, N, Vw, vec3(0.8), true, vis.g, cam.tipLight,  cam.tipColor,  occ1);
+        glow      += tipLight(vWorld, N, Vw, vec3(0.8), true, vis.b, cam.tipLight2, cam.tipColor2, occ2);
+        // Key letter shadows stay put. The playhead still lights the wash additively (`glow`); mixing
+        // the key term toward 1 with tip fill made those shadows crawl and punch out as the bar moved.
+        w *= mix(1.0, vis.r, KEY_SHADOW_STRENGTH);
         w *= min(occ1, occ2);
         w += glow;
         // Triangular-PDF dither (two hashes summed, recentred) breaks 8-bit banding in the dark wash
@@ -189,8 +180,8 @@ void main() {
     // to white; the specular is a small additive term on top. The tip lights pass shadowed = false: the
     // letter faces are frontmost, so nothing can fall between them and a light in front of them.
     vec3 lit = albedo * (ambient + 0.60 * diff) + vec3(spec * 0.08);
-    float washOcc, fillUnused;   // written by tipLight but unused here (shadowed = false)
-    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight,  cam.tipColor,  washOcc, fillUnused);
-    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight2, cam.tipColor2, washOcc, fillUnused);
+    float washOcc;   // written by tipLight but unused here (shadowed = false)
+    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight,  cam.tipColor,  washOcc);
+    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight2, cam.tipColor2, washOcc);
     outColor = vec4(lit + emberAdd, tx.a * pc.fade);
 }

@@ -26,16 +26,46 @@ static constexpr uint32_t mesh_tese_spv[] =
 static constexpr uint32_t wash_shadow_comp_spv[] =
 #include "shaders/wash_shadow_comp.inl"
 ;
+static constexpr uint32_t shadow_vert_spv[] =
+#include "shaders/shadow_vert.inl"
+;
+static constexpr uint32_t shadow_frag_spv[] =
+#include "shaders/shadow_frag.inl"
+;
+static constexpr uint32_t shadow_tese_spv[] =
+#include "shaders/shadow_tese.inl"
+;
 
 void vkCheck(VkResult r, std::source_location loc) {
     if (r != VK_SUCCESS)
         fatal(std::format("Vulkan call failed (VkResult {}) at {}:{}", static_cast<int>(r), loc.file_name(), loc.line()));
 }
 
+namespace {
+
+VkShaderModule makeShaderModule(VkDevice device, const uint32_t* code, size_t bytes) {
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = bytes;
+    ci.pCode = code;
+    VkShaderModule m = VK_NULL_HANDLE;
+    vkCheck(vkCreateShaderModule(device, &ci, nullptr, &m));
+    return m;
+}
+
+VkPipelineShaderStageCreateInfo shaderStage(VkShaderStageFlagBits stage, VkShaderModule mod) {
+    VkPipelineShaderStageCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage = stage;
+    ci.module = mod;
+    ci.pName = "main";
+    return ci;
+}
+
+}  // namespace
+
 void Renderer::initVulkan(PlatformWindow& window) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "EinBaumCurrentlyPlaying";
-    app.apiVersion = VK_API_VERSION_1_2;  // ray query / acceleration-structure deps are 1.2 core
+    app.apiVersion = VK_API_VERSION_1_2;
     std::vector<const char*> exts = window.requiredInstanceExtensions();
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
@@ -63,7 +93,7 @@ void Renderer::initVulkan(PlatformWindow& window) {
         if (phys_) break;
     }
     if (!phys_)
-        fatal("No suitable GPU: need a Vulkan 1.2 device with ray-query support and a graphics+present queue.");
+        fatal("No suitable GPU: need a Vulkan 1.2 device with a graphics+present queue.");
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -71,22 +101,7 @@ void Renderer::initVulkan(PlatformWindow& window) {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
 
-    // Ray-query, acceleration-structure, and bufferDeviceAddress are enabled outright with no
-    // feature query: a GPU that lacks them fails vkCreateDevice, which aborts via vkCheck.
-    std::vector<const char*> devExts = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-        VK_KHR_RAY_QUERY_EXTENSION_NAME,
-        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-    };
-    VkPhysicalDeviceRayQueryFeaturesKHR rqf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
-    rqf.rayQuery = VK_TRUE;
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR asf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
-    asf.accelerationStructure = VK_TRUE;
-    asf.pNext = &rqf;
-    VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    v12.bufferDeviceAddress = VK_TRUE;
-    v12.pNext = &asf;
+    std::vector<const char*> devExts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
     VkPhysicalDeviceFeatures feats{};
     feats.tessellationShader = VK_TRUE;
@@ -97,7 +112,6 @@ void Renderer::initVulkan(PlatformWindow& window) {
     dci.enabledExtensionCount = static_cast<uint32_t>(devExts.size());
     dci.ppEnabledExtensionNames = devExts.data();
     dci.pEnabledFeatures = &feats;
-    dci.pNext = &v12;
     vkCheck(vkCreateDevice(phys_, &dci, nullptr, &device_));
     vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
     pickSampleCount();
@@ -165,12 +179,6 @@ void Renderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, props);
-    // Buffers fed to vkGetBufferDeviceAddress must be allocated with the device-address flag set.
-    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
-        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        ai.pNext = &flags;
-    }
     vkCheck(vkAllocateMemory(device_, &ai, nullptr, &mem));
     vkBindBufferMemory(device_, buf, mem, 0);
 }
@@ -353,12 +361,8 @@ Mesh Renderer::createMesh(const std::vector<Vertex3>& verts, const std::vector<u
     VkDeviceSize vbytes = verts.size() * sizeof(Vertex3);
     VkDeviceSize ibytes = indices.size() * sizeof(uint32_t);
     const auto hostFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    // The vertex/index buffers double as acceleration-structure build input, so they also need the
-    // AS-build-input + device-address usage.
-    const auto asFlags = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    createBuffer(vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | asFlags, hostFlags, m.vbo, m.vboMem);
-    createBuffer(ibytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | asFlags, hostFlags, m.ibo, m.iboMem);
+    createBuffer(vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, hostFlags, m.vbo, m.vboMem);
+    createBuffer(ibytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, hostFlags, m.ibo, m.iboMem);
     void* p;
     vkMapMemory(device_, m.vboMem, 0, vbytes, 0, &p);
     std::memcpy(p, verts.data(), vbytes);
@@ -370,9 +374,6 @@ Mesh Renderer::createMesh(const std::vector<Vertex3>& verts, const std::vector<u
 }
 
 void Renderer::destroyMesh(Mesh& m) {
-    if (m.blas) pfnDestroyAS_(device_, m.blas, nullptr);
-    if (m.blasBuf) vkDestroyBuffer(device_, m.blasBuf, nullptr);
-    if (m.blasMem) vkFreeMemory(device_, m.blasMem, nullptr);
     if (m.vbo) vkDestroyBuffer(device_, m.vbo, nullptr);
     if (m.ibo) vkDestroyBuffer(device_, m.ibo, nullptr);
     if (m.vboMem) vkFreeMemory(device_, m.vboMem, nullptr);
@@ -548,9 +549,10 @@ void Renderer::createSwapchain() {
     cbai.commandBufferCount = n;
     vkCheck(vkAllocateCommandBuffers(device_, &cbai, cmds_.data()));
 
-    // The half-res shadow target tracks the swapchain extent. writeWashShadowDescriptors no-ops on
-    // the first call here (during init the compute pipeline's sets do not exist yet); init writes
-    // them once the pipeline is built, and every later recreate rewrites them to the new view.
+    // The half-res shadow target tracks the swapchain extent. washOccPass_ is created before the
+    // first swapchain, so the occ framebuffer attaches here. writeWashShadowDescriptors no-ops on
+    // the first call (compute pipeline sets do not exist yet); init writes them once the pipeline
+    // is built, and every later recreate rewrites them to the new view.
     createWashShadowImage();
     writeWashShadowDescriptors();
 }
@@ -574,8 +576,8 @@ void Renderer::makeMeshPipeline() {
     camBindings[0].binding = 0;
     camBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     camBindings[0].descriptorCount = 1;
-    // The evaluation stage reads viewProj to project the displaced patch vertices; the compute
-    // pass reads the tip lights and card half-height to trace the half-res wash shadow.
+    // Vertex/eval read viewProj (and the shadow pass reads tip lights to project onto the card);
+    // the compute pass reads the tip lights and card half-height to filter the half-res wash shadow.
     camBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
                                 VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     // binding 1: the half-res wash shadow image, sampled only by the Wash fragment path.
@@ -617,7 +619,7 @@ void Renderer::makeMeshPipeline() {
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                             VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                             0, sizeof(MeshPush)};
-    std::array<VkDescriptorSetLayout, 3> setLayouts{dsetLayout_, camLayout_, sceneAsLayout_};
+    std::array<VkDescriptorSetLayout, 2> setLayouts{dsetLayout_, camLayout_};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
     pli.pSetLayouts = setLayouts.data();
@@ -625,26 +627,11 @@ void Renderer::makeMeshPipeline() {
     pli.pPushConstantRanges = &pcr;
     vkCheck(vkCreatePipelineLayout(device_, &pli, nullptr, &meshPipeLayout_));
 
-    auto module = [&](const uint32_t* code, size_t bytes) {
-        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = bytes;
-        ci.pCode = code;
-        VkShaderModule m;
-        vkCheck(vkCreateShaderModule(device_, &ci, nullptr, &m));
-        return m;
-    };
-    auto stage = [](VkShaderStageFlagBits s, VkShaderModule m) {
-        VkPipelineShaderStageCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        ci.stage = s;
-        ci.module = m;
-        ci.pName = "main";
-        return ci;
-    };
-    VkShaderModule vert = module(mesh_vert_spv, sizeof(mesh_vert_spv));
-    VkShaderModule frag = module(mesh_frag_spv, sizeof(mesh_frag_spv));
+    VkShaderModule vert = makeShaderModule(device_, mesh_vert_spv, sizeof(mesh_vert_spv));
+    VkShaderModule frag = makeShaderModule(device_, mesh_frag_spv, sizeof(mesh_frag_spv));
     std::array<VkPipelineShaderStageCreateInfo, 2> stages{
-        stage(VK_SHADER_STAGE_VERTEX_BIT, vert),
-        stage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+        shaderStage(VK_SHADER_STAGE_VERTEX_BIT, vert),
+        shaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
     };
 
     VkVertexInputBindingDescription bind{0, sizeof(Vertex3), VK_VERTEX_INPUT_RATE_VERTEX};
@@ -716,13 +703,13 @@ void Renderer::makeMeshPipeline() {
     gp.subpass = 0;
     vkCheck(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &meshPipeline_));
 
-    VkShaderModule tesc = module(mesh_tesc_spv, sizeof(mesh_tesc_spv));
-    VkShaderModule tese = module(mesh_tese_spv, sizeof(mesh_tese_spv));
+    VkShaderModule tesc = makeShaderModule(device_, mesh_tesc_spv, sizeof(mesh_tesc_spv));
+    VkShaderModule tese = makeShaderModule(device_, mesh_tese_spv, sizeof(mesh_tese_spv));
     std::array<VkPipelineShaderStageCreateInfo, 4> tstages{
-        stage(VK_SHADER_STAGE_VERTEX_BIT, vert),
-        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tesc),
-        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, tese),
-        stage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+        shaderStage(VK_SHADER_STAGE_VERTEX_BIT, vert),
+        shaderStage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tesc),
+        shaderStage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, tese),
+        shaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
     };
 
     VkPipelineInputAssemblyStateCreateInfo tia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -743,25 +730,175 @@ void Renderer::makeMeshPipeline() {
     vkDestroyShaderModule(device_, tese, nullptr);
 }
 
-// Compute pipeline filling the half-res wash shadow image. Set 0 is its output storage image;
-// sets 1 and 2 reuse the camera UBO and scene-TLAS layouts, so the trace reads the same lights
-// and acceleration structure. Built after makeMeshPipeline/initSceneTlas.
+// Hard-occlusion render pass. Created before the first swapchain so createWashShadowImage can
+// attach a framebuffer; the pass outlives swapchain recreates.
+void Renderer::createWashOccPass() {
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_UNORM;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &colorRef;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = 0;
+    dep.dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 1;
+    rpci.pDependencies = &dep;
+    vkCheck(vkCreateRenderPass(device_, &rpci, nullptr, &washOccPass_));
+}
+
+// Graphics pipelines that project occluders onto the card plane into washOcc*. Built after
+// makeMeshPipeline (reuses camLayout_) and createWashOccPass.
+void Renderer::makeShadowPipeline() {
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0, sizeof(MeshPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &camLayout_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    vkCheck(vkCreatePipelineLayout(device_, &pli, nullptr, &shadowPipeLayout_));
+
+    VkShaderModule vert = makeShaderModule(device_, shadow_vert_spv, sizeof(shadow_vert_spv));
+    VkShaderModule frag = makeShaderModule(device_, shadow_frag_spv, sizeof(shadow_frag_spv));
+    std::array<VkPipelineShaderStageCreateInfo, 2> stages{
+        shaderStage(VK_SHADER_STAGE_VERTEX_BIT, vert),
+        shaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+    };
+
+    VkVertexInputBindingDescription bind{0, sizeof(Vertex3), VK_VERTEX_INPUT_RATE_VERTEX};
+    std::array<VkVertexInputAttributeDescription, 3> attrs{{
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex3, pos)},
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex3, normal)},
+        {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex3, uv)},
+    }};
+    VkPipelineVertexInputStateCreateInfo vin{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vin.vertexBindingDescriptionCount = 1;
+    vin.pVertexBindingDescriptions = &bind;
+    vin.vertexAttributeDescriptionCount = static_cast<uint32_t>(attrs.size());
+    vin.pVertexAttributeDescriptions = attrs.data();
+
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+    // MIN against a clear of 1: an occluder writes 0 in its light's channel and 1 elsewhere, so
+    // overlapping letters keep the channel dark without wiping the other lights.
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.colorBlendOp = VK_BLEND_OP_MIN;
+    cba.alphaBlendOp = VK_BLEND_OP_MIN;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    std::array<VkDynamicState, 2> dyn{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = static_cast<uint32_t>(dyn.size());
+    ds.pDynamicStates = dyn.data();
+
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp.stageCount = static_cast<uint32_t>(stages.size());
+    gp.pStages = stages.data();
+    gp.pVertexInputState = &vin;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &dss;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &ds;
+    gp.layout = shadowPipeLayout_;
+    gp.renderPass = washOccPass_;
+    gp.subpass = 0;
+    vkCheck(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &shadowPipeline_));
+
+    VkShaderModule tesc = makeShaderModule(device_, mesh_tesc_spv, sizeof(mesh_tesc_spv));
+    VkShaderModule tese = makeShaderModule(device_, shadow_tese_spv, sizeof(shadow_tese_spv));
+    std::array<VkPipelineShaderStageCreateInfo, 4> tstages{
+        shaderStage(VK_SHADER_STAGE_VERTEX_BIT, vert),
+        shaderStage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tesc),
+        shaderStage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, tese),
+        shaderStage(VK_SHADER_STAGE_FRAGMENT_BIT, frag),
+    };
+    VkPipelineInputAssemblyStateCreateInfo tia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    tia.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    VkPipelineTessellationStateCreateInfo tess{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+    tess.patchControlPoints = 3;
+    VkGraphicsPipelineCreateInfo tgp = gp;
+    tgp.stageCount = static_cast<uint32_t>(tstages.size());
+    tgp.pStages = tstages.data();
+    tgp.pInputAssemblyState = &tia;
+    tgp.pTessellationState = &tess;
+    vkCheck(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &tgp, nullptr, &shadowTessPipeline_));
+
+    vkDestroyShaderModule(device_, vert, nullptr);
+    vkDestroyShaderModule(device_, frag, nullptr);
+    vkDestroyShaderModule(device_, tesc, nullptr);
+    vkDestroyShaderModule(device_, tese, nullptr);
+}
+
+// Compute pipeline filling the half-res wash shadow image. Set 0 is the output storage image plus
+// the hard-occlusion sampler; set 1 reuses the camera UBO so range/gate match the fragment path.
 void Renderer::makeWashShadowPipeline() {
-    VkDescriptorSetLayoutBinding sb{};
-    sb.binding = 0;
-    sb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sb.descriptorCount = 1;
-    sb.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    std::array<VkDescriptorSetLayoutBinding, 2> sb{};
+    sb[0].binding = 0;
+    sb[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    sb[0].descriptorCount = 1;
+    sb[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    sb[1].binding = 1;
+    sb[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sb[1].descriptorCount = 1;
+    sb[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 1;
-    sli.pBindings = &sb;
+    sli.bindingCount = static_cast<uint32_t>(sb.size());
+    sli.pBindings = sb.data();
     vkCheck(vkCreateDescriptorSetLayout(device_, &sli, nullptr, &washStoreLayout_));
 
-    VkDescriptorPoolSize sps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1};
+    std::array<VkDescriptorPoolSize, 2> sps{{{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}}};
     VkDescriptorPoolCreateInfo spi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     spi.maxSets = 1;
-    spi.poolSizeCount = 1;
-    spi.pPoolSizes = &sps;
+    spi.poolSizeCount = static_cast<uint32_t>(sps.size());
+    spi.pPoolSizes = sps.data();
     vkCheck(vkCreateDescriptorPool(device_, &spi, nullptr, &washStorePool_));
     VkDescriptorSetAllocateInfo dsa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsa.descriptorPool = washStorePool_;
@@ -777,53 +914,74 @@ void Renderer::makeWashShadowPipeline() {
     smp.addressModeU = smp.addressModeV = smp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vkCheck(vkCreateSampler(device_, &smp, nullptr, &washSampler_));
 
-    std::array<VkDescriptorSetLayout, 3> setLayouts{washStoreLayout_, camLayout_, sceneAsLayout_};
+    // PCF taps that walk off the card must read fully-lit, not a clamped edge of an occluder.
+    VkSamplerCreateInfo osmp = smp;
+    osmp.addressModeU = osmp.addressModeV = osmp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    osmp.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    vkCheck(vkCreateSampler(device_, &osmp, nullptr, &washOccSampler_));
+
+    std::array<VkDescriptorSetLayout, 2> setLayouts{washStoreLayout_, camLayout_};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
     pli.pSetLayouts = setLayouts.data();
     vkCheck(vkCreatePipelineLayout(device_, &pli, nullptr, &washShadowPipeLayout_));
 
-    VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mci.codeSize = sizeof(wash_shadow_comp_spv);
-    mci.pCode = wash_shadow_comp_spv;
-    VkShaderModule comp;
-    vkCheck(vkCreateShaderModule(device_, &mci, nullptr, &comp));
-    VkPipelineShaderStageCreateInfo cs{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    cs.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cs.module = comp;
-    cs.pName = "main";
+    VkShaderModule comp = makeShaderModule(device_, wash_shadow_comp_spv, sizeof(wash_shadow_comp_spv));
     VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cpci.stage = cs;
+    cpci.stage = shaderStage(VK_SHADER_STAGE_COMPUTE_BIT, comp);
     cpci.layout = washShadowPipeLayout_;
     vkCheck(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &washShadowPipeline_));
     vkDestroyShaderModule(device_, comp, nullptr);
 }
 
+void Renderer::createWashOccFramebuffer() {
+    if (!washOccPass_ || !washOccView_) return;
+    if (washOccFb_) {
+        vkDestroyFramebuffer(device_, washOccFb_, nullptr);
+        washOccFb_ = VK_NULL_HANDLE;
+    }
+    VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fbci.renderPass = washOccPass_;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &washOccView_;
+    fbci.width = washShadowExtent_.width;
+    fbci.height = washShadowExtent_.height;
+    fbci.layers = 1;
+    vkCheck(vkCreateFramebuffer(device_, &fbci, nullptr, &washOccFb_));
+}
+
 void Renderer::createWashShadowImage() {
     washShadowExtent_ = {(extent_.width + 1) / 2, (extent_.height + 1) / 2};
-    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    ici.extent = {washShadowExtent_.width, washShadowExtent_.height, 1};
-    ici.mipLevels = 1;
-    ici.arrayLayers = 1;
-    ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    vkCheck(vkCreateImage(device_, &ici, nullptr, &washShadowImage_));
-    allocBindImageMemory(washShadowImage_, washShadowMem_);
 
-    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vci.image = washShadowImage_;
-    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = ici.format;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCheck(vkCreateImageView(device_, &vci, nullptr, &washShadowView_));
+    auto makeImg = [&](VkFormat fmt, VkImageUsageFlags usage, VkImage& img, VkDeviceMemory& mem, VkImageView& view) {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent = {washShadowExtent_.width, washShadowExtent_.height, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = usage;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        vkCheck(vkCreateImage(device_, &ici, nullptr, &img));
+        allocBindImageMemory(img, mem);
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = img;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = fmt;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCheck(vkCreateImageView(device_, &vci, nullptr, &view));
+    };
+    makeImg(VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            washShadowImage_, washShadowMem_, washShadowView_);
+    makeImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            washOccImage_, washOccMem_, washOccView_);
 
-    // To GENERAL once: the compute pass writes it and the fragment samples it, both from GENERAL,
-    // so the per-frame command buffer only needs the compute->fragment memory barrier.
+    // Soft target to GENERAL once: the compute pass writes it and the fragment samples it, both
+    // from GENERAL, so the per-frame command buffer only needs the compute->fragment memory barrier.
+    // The occ target is transitioned by its render pass (UNDEFINED -> COLOR -> SHADER_READ).
     submitNow([&](VkCommandBuffer cb) {
         VkImageMemoryBarrier br{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         br.srcQueueFamilyIndex = br.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -834,9 +992,16 @@ void Renderer::createWashShadowImage() {
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &br);
     });
+    createWashOccFramebuffer();
 }
 
 void Renderer::destroyWashShadowImage() {
+    if (washOccFb_) vkDestroyFramebuffer(device_, washOccFb_, nullptr);
+    if (washOccView_) vkDestroyImageView(device_, washOccView_, nullptr);
+    if (washOccImage_) vkDestroyImage(device_, washOccImage_, nullptr);
+    if (washOccMem_) vkFreeMemory(device_, washOccMem_, nullptr);
+    washOccFb_ = VK_NULL_HANDLE; washOccView_ = VK_NULL_HANDLE;
+    washOccImage_ = VK_NULL_HANDLE; washOccMem_ = VK_NULL_HANDLE;
     if (washShadowView_) vkDestroyImageView(device_, washShadowView_, nullptr);
     if (washShadowImage_) vkDestroyImage(device_, washShadowImage_, nullptr);
     if (washShadowMem_) vkFreeMemory(device_, washShadowMem_, nullptr);
@@ -844,10 +1009,11 @@ void Renderer::destroyWashShadowImage() {
 }
 
 void Renderer::writeWashShadowDescriptors() {
-    if (!camSet_ || !washStoreSet_ || !washShadowView_) return;
+    if (!camSet_ || !washStoreSet_ || !washShadowView_ || !washOccView_ || !washOccSampler_) return;
     VkDescriptorImageInfo store{VK_NULL_HANDLE, washShadowView_, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo samp{washSampler_, washShadowView_, VK_IMAGE_LAYOUT_GENERAL};
-    std::array<VkWriteDescriptorSet, 2> w{};
+    VkDescriptorImageInfo occ{washOccSampler_, washOccView_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    std::array<VkWriteDescriptorSet, 3> w{};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = washStoreSet_;
     w[0].dstBinding = 0;
@@ -860,5 +1026,11 @@ void Renderer::writeWashShadowDescriptors() {
     w[1].descriptorCount = 1;
     w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     w[1].pImageInfo = &samp;
+    w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[2].dstSet = washStoreSet_;
+    w[2].dstBinding = 1;
+    w[2].descriptorCount = 1;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[2].pImageInfo = &occ;
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(w.size()), w.data(), 0, nullptr);
 }

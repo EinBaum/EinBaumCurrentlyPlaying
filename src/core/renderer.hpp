@@ -38,10 +38,6 @@ struct Mesh {
     VkDeviceMemory vboMem = VK_NULL_HANDLE, iboMem = VK_NULL_HANDLE;
     uint32_t indexCount = 0;
     uint32_t vertexCount = 0;
-    VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
-    VkBuffer blasBuf = VK_NULL_HANDLE;
-    VkDeviceMemory blasMem = VK_NULL_HANDLE;
-    VkDeviceAddress blasAddr = 0;
 };
 
 struct GlyphInstance {
@@ -141,11 +137,14 @@ private:
     VkDeviceMemory camUboMem_ = VK_NULL_HANDLE;
     void* camUboMapped_ = nullptr;
 
-    // Half-resolution wash shadow term from wash_shadow.comp (R = key, G/B = tip lights). Half the
-    // swapchain extent, rebuilt on resize; stays in GENERAL layout (compute writes, fragment samples).
+    // Wash-plane shadows, half the swapchain extent, rebuilt on resize. Occluders are projected
+    // onto the card into washOcc* (hard 0/1 per light channel, MIN blend). wash_shadow.comp
+    // PCF-filters that into washShadow* (R = key, G/B = tip lights), which stays in GENERAL
+    // (compute writes, fragment samples). washOccPass_ outlives the swapchain; the framebuffer
+    // is rebuilt with the images.
     VkPipeline washShadowPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout washShadowPipeLayout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout washStoreLayout_ = VK_NULL_HANDLE;  // compute set 0: the output storage image
+    VkDescriptorSetLayout washStoreLayout_ = VK_NULL_HANDLE;  // compute set 0: output + hard occlusion
     VkDescriptorPool washStorePool_ = VK_NULL_HANDLE;
     VkDescriptorSet washStoreSet_ = VK_NULL_HANDLE;
     VkSampler washSampler_ = VK_NULL_HANDLE;
@@ -153,48 +152,15 @@ private:
     VkDeviceMemory washShadowMem_ = VK_NULL_HANDLE;
     VkImageView washShadowView_ = VK_NULL_HANDLE;
     VkExtent2D washShadowExtent_{};
-
-    // --- Ray-traced shadow scene (renderer_raytracing.cpp) ---
-    // Scene acceleration structure (set 2), rebuilt each frame from the drawn occluder meshes; the
-    // TLAS/scratch/instance buffers are sized once for the worst-case instance count.
-    static constexpr uint32_t kMaxSceneInstances = 1024;
-    VkDescriptorSetLayout sceneAsLayout_ = VK_NULL_HANDLE;  // set 2: scene TLAS
-    VkDescriptorPool sceneAsPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet sceneAsSet_ = VK_NULL_HANDLE;
-    VkAccelerationStructureKHR sceneTlas_ = VK_NULL_HANDLE;
-    VkBuffer sceneTlasBuf_ = VK_NULL_HANDLE, sceneInstBuf_ = VK_NULL_HANDLE, sceneScratchBuf_ = VK_NULL_HANDLE;
-    VkDeviceMemory sceneTlasMem_ = VK_NULL_HANDLE, sceneInstMem_ = VK_NULL_HANDLE, sceneScratchMem_ = VK_NULL_HANDLE;
-    void* sceneInstMapped_ = nullptr;
-    VkDeviceAddress sceneScratchAddr_ = 0;
-    // Occluder instances from the last TLAS build; an identical set next frame skips the rebuild.
-    // tlasBuilt_ forces the first build, since initSceneTlas creates the TLAS without building it.
-    std::vector<VkAccelerationStructureInstanceKHR> lastBuiltInsts_;
-    bool tlasBuilt_ = false;
-
-    // First-seen glyph BLAS builds queued during layout and recorded in one submit by flushPendingBlas.
-    // bgi.pGeometries must be re-pointed at geom at flush: pushing relocates the vector.
-    struct PendingBlas {
-        VkAccelerationStructureGeometryKHR geom{};
-        VkAccelerationStructureBuildGeometryInfoKHR bgi{};
-        uint32_t primCount = 0;
-        VkBuffer scratch = VK_NULL_HANDLE;
-        VkDeviceMemory scratchMem = VK_NULL_HANDLE;
-    };
-    std::vector<PendingBlas> pendingBlas_;
-    // Scratch from flushPendingBlas(cb); freed after the frame fence (one in-flight frame).
-    struct GpuScratch {
-        VkBuffer buf = VK_NULL_HANDLE;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
-    };
-    std::vector<GpuScratch> inFlightBlasScratch_;
-
-    // VK_KHR_acceleration_structure entry points, resolved at runtime by loadRayTracingFns.
-    PFN_vkGetBufferDeviceAddressKHR pfnGetBufferDeviceAddress_ = nullptr;
-    PFN_vkCreateAccelerationStructureKHR pfnCreateAS_ = nullptr;
-    PFN_vkDestroyAccelerationStructureKHR pfnDestroyAS_ = nullptr;
-    PFN_vkGetAccelerationStructureBuildSizesKHR pfnGetASBuildSizes_ = nullptr;
-    PFN_vkCmdBuildAccelerationStructuresKHR pfnCmdBuildAS_ = nullptr;
-    PFN_vkGetAccelerationStructureDeviceAddressKHR pfnGetASDeviceAddr_ = nullptr;
+    VkRenderPass washOccPass_ = VK_NULL_HANDLE;
+    VkFramebuffer washOccFb_ = VK_NULL_HANDLE;
+    VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
+    VkPipeline shadowTessPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout shadowPipeLayout_ = VK_NULL_HANDLE;
+    VkSampler washOccSampler_ = VK_NULL_HANDLE;
+    VkImage washOccImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory washOccMem_ = VK_NULL_HANDLE;
+    VkImageView washOccView_ = VK_NULL_HANDLE;
 
     // --- Scene resources and per-track state (renderer.cpp) ---
     Mesh unitQuad_;   // [0,1]x[0,1] quad
@@ -297,10 +263,13 @@ private:
     void destroySwapchain();
     void createRenderTargets();
     void destroyRenderTargets();
+    void createWashOccPass();
     void makeMeshPipeline();
+    void makeShadowPipeline();
     void makeWashShadowPipeline();
     void createWashShadowImage();
     void destroyWashShadowImage();
+    void createWashOccFramebuffer();
     void writeWashShadowDescriptors();
     [[nodiscard]] uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props);
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -313,16 +282,6 @@ private:
     void deferDestroyTexture(Texture& t);
     [[nodiscard]] Mesh createMesh(const std::vector<Vertex3>& verts, const std::vector<uint32_t>& indices);
     void destroyMesh(Mesh& m);
-
-    // renderer_raytracing.cpp: acceleration structures.
-    void loadRayTracingFns();
-    void ensureMeshBlas(Mesh& m);
-    void prepareMeshBlas(Mesh& m);
-    void flushPendingBlas();
-    void flushPendingBlas(VkCommandBuffer cb);
-    void initSceneTlas();
-    void buildSceneTlas(VkCommandBuffer cb, const std::vector<VkAccelerationStructureInstanceKHR>& insts);
-    [[nodiscard]] VkDeviceAddress bufferAddr(VkBuffer b) const;
 
     // renderer.cpp: text layout and track state.
     [[nodiscard]] GpuGlyph glyphGpuMesh(const FontFace& f, uint32_t cp);

@@ -1,7 +1,8 @@
 # EinBaumCurrentlyPlaying
 
 Borderless "now playing" overlay for OBS, drawn with Vulkan. Shows album cover, title, artist, and
-progress bar on a green chroma-key card.
+progress bar on a green chroma-key card. The card is a small 3D scene: extruded letters, a
+progress-bar rod, and soft wash-plane shadows (rasterized projections, not ray-traced).
 
 ![screenshot](screenshot.jpg)
 
@@ -37,7 +38,7 @@ EinBaumCurrentlyPlaying --http  # enables HTTP API
 
 ## Requirements
 
-- GPU with hardware ray tracing + Vulkan 1.2 driver (NVIDIA RTX 20xx+, AMD RX 6000+/890M, Intel Arc).
+- GPU with a Vulkan 1.2 driver.
 - Windows 10/11 x64, or Linux + Wayland.
 
 ## Build

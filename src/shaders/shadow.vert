@@ -1,21 +1,21 @@
 #version 460
 
-// model is a per-element translate/scale with no rotation. Normals are axis-aligned (quads),
-// uniformly scaled (glyphs), or radial with equal cross-section scale (rod), so mat3(model)
-// transforms them correctly and no inverse-transpose is needed.
+// Shadow-pass vertex stage. Transforms into world, then projects onto the card plane along the
+// light selected by pc.mode. The tessellated rod path overwrites gl_Position in shadow.tese after
+// Phong smoothing.
+
+#define CAM_SET 0
+#include "shadow_common.glsl"
 
 layout(location = 0) in vec3 inPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUV;
-
-#include "shadow_common.glsl"   // Camera (set 1, binding 0)
 
 layout(push_constant) uniform PC {
     mat4 model;
     vec4 color;
     float fade;
     int mode;
-    float barLen;
 } pc;
 
 layout(location = 0) out vec3 vNormal;
@@ -27,5 +27,5 @@ void main() {
     vWorld = world.xyz;
     vNormal = mat3(pc.model) * inNormal;
     vUV = inUV;
-    gl_Position = cam.viewProj * world;
+    gl_Position = projectToWashClip(vWorld, pc.mode);
 }

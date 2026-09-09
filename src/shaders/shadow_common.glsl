@@ -1,36 +1,39 @@
-// Shared by mesh.frag and wash_shadow.comp: the scene camera, the disintegration death field, and the
-// soft ray-traced shadow trace. Included after #version and `#extension GL_EXT_ray_query : require`.
-// Keeping the death field here is load-bearing: the shadow erosion and the fragment's visible discard
-// must read the same field, or the cast shadow would not match the burned-away geometry.
+// Shared by mesh.frag, the shadow projection shaders, and wash_shadow.comp: the scene camera, the
+// disintegration death field, and the wash-plane projection used to rasterize letter/rod shadows.
+// Keeping the death field here is load-bearing: the shadow discard and the fragment's visible
+// discard must read the same field, or the cast shadow would not match the burned-away geometry.
+//
+// CAM_SET selects the descriptor set that holds the camera UBO (1 for the mesh/compute paths, 0
+// for the shadow-projection pass which has no texture set).
 
-layout(set = 1, binding = 0) uniform Camera {
+#ifndef CAM_SET
+#define CAM_SET 1
+#endif
+
+layout(set = CAM_SET, binding = 0) uniform Camera {
     mat4 viewProj;
     vec4 camPos;
-    vec4 params;     // x = card aspect (W/H), y = card world half-height, zw = marquee column edges (world x; w<=z off)
+    vec4 params;     // x = card aspect (W/H), y = card world half-height, zw unused
     vec4 tipLight;   // xyz = world position, w = range (0 = off)
     vec4 tipColor;   // rgb = colour, a = intensity
     vec4 tipLight2;  // second tip light, same layout as tipLight
     vec4 tipColor2;  // rgb = colour, a = intensity (0 = off)
     vec4 tipShadow;  // x = tipLight cast-shadow gate, y = tipLight2 gate (0 = casts no shadow, 1 = full)
 } cam;
-layout(set = 2, binding = 0) uniform accelerationStructureEXT sceneTlas;
 
 // Fixed directional key light, direction toward the source (+x right, +y up, +z toward viewer): the
 // dominant +z keeps front faces lit; the upper-left tilt throws each letter's shadow to its lower-right.
 const vec3 KEY_LIGHT_DIR = vec3(-0.4, 0.4, 1.0);
-// Direction the key shadow is traced toward, separate from the shading direction. A directional
+// Direction the key shadow is projected along, separate from the shading direction. A directional
 // shadow's displacement scales with L.xy / L.z, so halving xy shortens the cast-shadow throw by 50%.
 const vec3 KEY_SHADOW_DIR = vec3(KEY_LIGHT_DIR.xy * 0.5, KEY_LIGHT_DIR.z);
 
-// World z of the virtual source the tip light's cast shadow is traced toward, distinct from the real
-// shading light: held near the card plane for a long grazing streak, just in front of the glyph faces.
+// World z of the virtual source the tip light's cast shadow is projected from, distinct from the
+// real shading light: held near the card plane for a long grazing streak, just in front of the glyph faces.
 const float TIP_SHADOW_Z = 0.0978;
-// Disk radius for the tip light's soft shadow (wider = softer penumbra).
-const float TIP_SHADOW_RADIUS = 0.03;
-
-// Fixed-point scale a dissolving glyph's progress is packed into its TLAS custom index with (matches
-// DISS_ENCODE in renderer.cpp). DISS_ENC keeps the 0..~1.05 range well inside the 24-bit field.
-const float DISS_ENC = 1048576.0;
+// Disk radius for the soft-shadow PCF (wider = softer, more scattered penumbra). Key and tip share
+// one radius; wash_shadow.comp samples all three channels at the same offsets.
+const float SHADOW_PCF_RADIUS = 0.02;
 
 float hash13(vec3 p) {
     p = fract(p * 0.1031);
@@ -51,34 +54,36 @@ float vnoise(vec2 x) {
 float dissolveField(vec2 p) {
     return 0.6 * vnoise(p * 28.0) + 0.4 * vnoise(p * 75.6);
 }
-
-// Soft ray-traced shadow toward L: eight rays across a disk of `radius`, tested against `mask` out to
-// `tMax`, origin lifted off the surface to avoid acne. Returns 1 fully lit; at full occlusion 1 - hardness.
-// A dissolving letter is non-opaque and carries its dissolve progress in the custom index, so each
-// candidate hit is confirmed only where the death field shows the letter has not yet burned away.
-float traceShadow(vec3 P, vec3 N, vec3 L, float tMax, uint mask, float hardness, float radius) {
-    vec3 up = abs(L.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 t = normalize(cross(up, L));
-    vec3 b = cross(L, t);
-    const vec2 J[8] = vec2[](
-        vec2( 0.40,  0.0),  vec2(-0.40,  0.0),  vec2( 0.0,  0.40),  vec2( 0.0, -0.40),
-        vec2( 0.64,  0.64), vec2(-0.64,  0.64), vec2( 0.64, -0.64), vec2(-0.64, -0.64));
-    vec3 origin = P + N * 0.003 + L * 0.003;
+// Per-fragment death threshold: the noise field plus a bottom-to-top rise bias. mesh.frag and
+// shadow.frag must use this same value so a burning letter's shadow erodes with its visible bits.
+float dissolveDeath(vec3 world) {
     float halfH = max(cam.params.y, 1e-4);
-    float occ = 0.0;
-    for (int i = 0; i < 8; i++) {
-        vec3 d = normalize(L + (t * J[i].x + b * J[i].y) * radius);
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, sceneTlas, gl_RayFlagsTerminateOnFirstHitEXT, mask, origin, 0.0, d, tMax);
-        while (rayQueryProceedEXT(rq)) {
-            float diss = float(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false)) * (1.0 / DISS_ENC);
-            vec3 hp = origin + d * rayQueryGetIntersectionTEXT(rq, false);
-            float rise = clamp((hp.y + halfH) / (2.0 * halfH), 0.0, 1.0);
-            float death = mix(dissolveField(hp.xy), rise, 0.3);
-            if (death - diss > 0.0) rayQueryConfirmIntersectionEXT(rq);
-        }
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT)
-            occ += 1.0;
+    float rise = clamp((world.y + halfH) / (2.0 * halfH), 0.0, 1.0);
+    return mix(dissolveField(world.xy), rise, 0.3);
+}
+
+// Map a card-plane world XY to the wash-shadow image's UV (u across x in [-1,1], v down y from
+// +halfH to -halfH). Inverse of the reconstruction in wash_shadow.comp.
+vec2 worldToWashUv(vec2 w) {
+    float halfH = max(cam.params.y, 1e-4);
+    return vec2(w.x * 0.5 + 0.5, 0.5 - w.y / (2.0 * halfH));
+}
+
+// Project a world-space occluder point onto the card plane (z = 0) and return Vulkan clip for the
+// wash-shadow target: x = world x in [-1,1], y flipped so +world-y is the top of the image.
+// lightMode 0 = key (directional), 1 = tipLight, 2 = tipLight2.
+vec4 projectToWashClip(vec3 world, int lightMode) {
+    vec3 projP;
+    if (lightMode <= 0) {
+        vec3 L = KEY_SHADOW_DIR;
+        projP = world + L * (-world.z / max(L.z, 1e-6));
+    } else {
+        vec4 light = lightMode == 1 ? cam.tipLight : cam.tipLight2;
+        vec3 S = vec3(light.xy, TIP_SHADOW_Z);
+        vec3 d = world - S;
+        float dz = abs(d.z) < 1e-6 ? 1e-6 : d.z;
+        projP = S + d * (-S.z / dz);
     }
-    return 1.0 - (occ * 0.125) * hardness;
+    float halfH = max(cam.params.y, 1e-4);
+    return vec4(projP.x, -projP.y / halfH, 0.0, 1.0);
 }
