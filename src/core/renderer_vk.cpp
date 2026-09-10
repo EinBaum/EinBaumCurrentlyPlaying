@@ -814,8 +814,9 @@ void Renderer::makeShadowPipeline() {
 
     VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
 
-    // MIN against a clear of 1: an occluder writes 0 in its light's channel and 1 elsewhere, so
-    // overlapping letters keep the channel dark without wiping the other lights.
+    // MIN against a clear of 1: an occluder writes (1 - fade) in its light's channel and 1
+    // elsewhere, so overlapping letters keep the channel at the darkest contribution without
+    // wiping the other light.
     VkPipelineColorBlendAttachmentState cba{};
     cba.blendEnable = VK_TRUE;
     cba.colorBlendOp = VK_BLEND_OP_MIN;
@@ -877,7 +878,7 @@ void Renderer::makeShadowPipeline() {
 }
 
 // Compute pipeline filling the half-res wash shadow image. Set 0 is the output storage image plus
-// the hard-occlusion sampler; set 1 reuses the camera UBO so range/gate match the fragment path.
+// the hard-occlusion sampler; set 1 reuses the camera UBO so range matches the fragment path.
 void Renderer::makeWashShadowPipeline() {
     std::array<VkDescriptorSetLayoutBinding, 2> sb{};
     sb[0].binding = 0;

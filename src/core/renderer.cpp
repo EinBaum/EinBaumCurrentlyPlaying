@@ -17,7 +17,10 @@
 
 namespace {
 
+// Song-to-song swap is TRANSITION_SEC: outgoing fades out over the first half, incoming fades in
+// over the second.
 constexpr double TRANSITION_SEC = 3.0;
+constexpr double TEXT_FADE_SEC = TRANSITION_SEC / 2.0;
 
 // A frame-to-frame change in the true playhead larger than SEEK_JUMP_SEC, beyond what elapsed
 // playback explains, is treated as a seek and glided over SEEK_GLIDE_SEC.
@@ -27,11 +30,6 @@ constexpr double SEEK_JUMP_SEC = 1.5;
 // Ease time between the accent/PAUSED_FG colours and full/PAUSED_TIP_SCALE intensities on a
 // play/pause change.
 constexpr double PLAY_FADE_SEC = 0.5;
-
-// The text swap runs in two sequential halves of TEXT_DISSOLVE_SEC each, together filling
-// TRANSITION_SEC. DISSOLVE_END is slightly past 1 so the last glyph fragments and their ember clear.
-constexpr double TEXT_DISSOLVE_SEC = 1.5;
-constexpr float DISSOLVE_END = 1.05f;
 
 // A line too long for its column holds left-aligned for MARQUEE_HOLD_SEC (> TRANSITION_SEC, so a
 // new line is solid before it moves), then drifts left at MARQUEE_EM_PER_SEC of its own em-widths
@@ -55,9 +53,6 @@ struct DrawItem {
     VkDescriptorSet tex;
     bool tess = false;
     float tessLevel = 0.0f;
-    float barDissolve = 0.0f; // bar fill only: >0 runs the left-to-right dissolve-out (0..1 progress)
-    float dissolve = 0.0f;    // >0 runs the per-glyph disintegration
-    vec4 dissolveColor{};
     float barLen = 0.0f;      // bar fill only: the rod's world length, sizing the tip in fixed world units
     float liveBar = 0.0f;     // bar fill only: >0 = live stream, glows uniformly with no playhead tip
     float washDim = 1.0f;     // wash only: per-cover darkening factor for the blurred background
@@ -81,10 +76,6 @@ constexpr float Z_ALBUM = 0.0f;
 constexpr float Z_BAR = 0.008f;
 constexpr float Z_BAR_FILL = 0.010f;
 constexpr float Z_TEXT = 0.020f;
-
-// Two progress fills coincide during a song change; the incoming fill is lifted this far (nearer)
-// to win the shared depth, staying in the bar's z-band.
-constexpr float Z_FILL_OVER = 0.001f;
 
 // Oblique-projection shear per world unit of depth, bringing the right and bottom side walls of
 // every letter into view. Anchored at the card plane (z = 0) so the full-window background fills
@@ -263,8 +254,7 @@ float Renderer::armLine(Marquee& m, float laidW, float colW, float emWorld, floa
 }
 
 void Renderer::buildCurrent(const Track& t, bool redecode) {
-    // Keep burn: beginTextBurn latched it from the outgoing line before this runs.
-    for (Marquee& m : mq_) { auto burn = m.burn; m = Marquee{}; m.burn = burn; }
+    for (Marquee& m : mq_) m = Marquee{};
     // The cover slot is reserved from the bytes alone so the layout stands before the decode lands;
     // an already-valid album_ (setTrack kept an identical cover) needs no decode unless the caller
     // is replacing the shown cover with new bytes (redecode).
@@ -277,6 +267,8 @@ void Renderer::buildCurrent(const Track& t, bool redecode) {
 }
 
 void Renderer::layoutText(const Track& t) {
+    titleGlyphs_.clear();
+    artistGlyphs_.clear();
     const float txPx = artWait_.reserved ? static_cast<float>(WIN_H) + PAD : static_cast<float>(PAD);
     const float penX0 = worldX(txPx);
     const float maxX = worldX(WIN_W - PAD);
@@ -325,78 +317,142 @@ void Renderer::layoutText(const Track& t) {
     }
 }
 
-void Renderer::beginTextBurn(bool burnTitle, bool burnArtist) {
-    outgoingTitleGlyphs_.clear();
-    outgoingArtistGlyphs_.clear();
-    // Freeze the scroll where the last drawn frame left it (fpsLastSteady_ is that frame's clock).
-    auto latch = [&](Marquee& m, bool burning) {
-        m.burn = Marquee::Burn{};
-        if (!burning || !m.active) return;
-        m.burn.on = true;
-        m.burn.period = m.width + m.gap;
-        // An armed line has no latched start (never drawn), so it froze at offset zero.
-        double scroll = m.armed ? 0.0 : std::max(0.0, (fpsLastSteady_ - m.start) - MARQUEE_HOLD_SEC) * m.speed;
-        m.burn.shift = m.burn.period > 0.0f ? static_cast<float>(std::fmod(scroll, m.burn.period)) : 0.0f;
-    };
-    latch(mq(Line::Title), burnTitle);
-    latch(mq(Line::Artist), burnArtist);
-    if (burnTitle)  outgoingTitleGlyphs_  = std::move(titleGlyphs_);
-    if (burnArtist) outgoingArtistGlyphs_ = std::move(artistGlyphs_);
-    titleGlyphs_.clear();  artistGlyphs_.clear();
-    outgoingEmberAccent_ = hasAlbumAccent_ ? albumAccent_ : ACCENT;
+// Move the live line into its outgoing slot. The scroll freezes where the last drawn frame left
+// it (fpsLastSteady_ is that frame's clock); an armed line was never drawn, so it froze at zero.
+void Renderer::latchOutgoingLine(Line l) {
+    const Marquee& m = mq(l);
+    OutgoingLine& o = outgoing(l);
+    o.changed = true;
+    o.glyphs = std::move(glyphs(l));
+    o.scrolling = m.active;
+    o.period = m.width + m.gap;
+    double scroll = m.armed ? 0.0 : std::max(0.0, (fpsLastSteady_ - m.start) - MARQUEE_HOLD_SEC) * m.speed;
+    o.shift = o.period > 0.0f ? static_cast<float>(std::fmod(scroll, o.period)) : 0.0f;
+}
+
+// Replace the incoming song without touching the outgoing fade or the transition clock. A fast
+// skip must not fade in the cover of a song that has already been left.
+void Renderer::retargetIncoming(const Track& t) {
+    // A line the first change left solid still shows the outgoing song's text, so it is latched
+    // now if the latest song differs. A latched line whose text the latest song restores is
+    // dropped: the incoming line is laid with that text and draws solid.
+    for (Line l : {Line::Title, Line::Artist}) {
+        const bool changed = lineText(t, l) != lineText(outgoingTrack_, l);
+        if (changed && !outgoing(l).changed) latchOutgoingLine(l);
+        else if (!changed) outgoing(l) = {};
+    }
+    coverChanged_ = t.artPng != outgoingTrack_.artPng;
+
+    // Any decode in flight is for a song we just skipped. It is dropped so its result cannot land on
+    // album_ after this retarget (submit() sequence numbers start at 1).
+    artWait_.pending = false;
+    artWait_.seq = 0;
+
+    // With no separate outgoing texture, album_ is the outgoing song's cover only while the
+    // skipped song shared its bytes (setTrack made no handoff). Otherwise it is the skipped
+    // song's own decode and must not be shown for any other song.
+    const bool albumIsOutgoing = !outgoingAlbum_.valid && currentTrack_.artPng == outgoingTrack_.artPng;
+
+    if (!coverChanged_) {
+        // Same bytes as the outgoing cover: hold that image solid, no cover fade.
+        if (outgoingAlbum_.valid) {
+            deferDestroyTexture(album_);
+            album_ = outgoingAlbum_;
+            outgoingAlbum_ = {};
+            washDim_ = outgoingWashDim_;
+            albumAccent_ = outgoingAccent_;
+            hasAlbumAccent_ = outgoingHasAccent_;
+        } else if (!albumIsOutgoing) {
+            deferDestroyTexture(album_);
+            album_ = {};
+            hasAlbumAccent_ = false;
+        }
+    } else if (t.artPng != currentTrack_.artPng) {
+        if (albumIsOutgoing) {
+            // The shared cover fades out with the outgoing song. Its accent and wash factor were
+            // latched by setTrack.
+            outgoingAlbum_ = album_;
+        } else {
+            // Keep outgoingAlbum_ (the song still fading out). Incoming GPU cover is the skipped song.
+            deferDestroyTexture(album_);
+        }
+        album_ = {};
+        hasAlbumAccent_ = false;
+    }
+
+    havePlayhead_ = false;
+    seekGliding_ = false;
+    playOffset_ = 0.0;
+    playFade_ = playFadeTarget_ = t.playing ? 1.0f : 0.0f;
+    playFading_ = false;
+
+    buildCurrent(t, coverChanged_ && !t.artPng.empty() && !album_.valid);
+    currentTrack_ = t;
 }
 
 void Renderer::setTrack(const Track& t) {
-    // A change requested mid-dissolve does not interrupt it: buffer the latest request (overwritten
-    // by each further change, so a fast-skip burst collapses to the final song) and promote it when
-    // the running dissolve completes (see draw). A media-cleared request is a hard cut, never buffered.
-    if (t.valid && state_ == PlaybackState::Transitioning) {
-        pendingTrack_.track = t;
-        pendingTrack_.queued = true;
+    // A skip during the fade-out half replaces the still invisible incoming song in place, so the
+    // outgoing song keeps fading and no skipped song's text or cover is ever drawn. A skip during
+    // the fade-in half falls through to a fresh change: the partly visible incoming song becomes
+    // the outgoing one and fades out from its current opacity. A media-cleared request is a hard
+    // cut, never folded into a running fade.
+    const bool transitioning = state_ == PlaybackState::Transitioning;
+    const double fadeDt = transitionArmed_ ? 0.0 : fpsLastSteady_ - transitionStart_;
+    if (t.valid && transitioning && fadeDt < TEXT_FADE_SEC) {
+        retargetIncoming(t);
         return;
     }
+    const float incomingFade = transitioning ? static_cast<float>(std::clamp((fadeDt - TEXT_FADE_SEC) / TEXT_FADE_SEC, 0.0, 1.0)) : 1.0f;
 
     if (!t.valid) {
         // Media cleared. The card-to-key transition is a hard cut: drop everything with no fade.
         state_ = PlaybackState::NoMedia;  transitionArmed_ = false;
-        pendingTrack_.queued = false;
         for (Marquee& m : mq_) m = Marquee{};
-        outgoingTitleGlyphs_.clear();  outgoingArtistGlyphs_.clear();
+        for (OutgoingLine& o : outgoing_) o = {};
         deferDestroyTexture(outgoingAlbum_);
         deferDestroyTexture(album_);
         titleGlyphs_.clear();       artistGlyphs_.clear();
         hasAlbumAccent_ = false;
         artWait_ = ArtWait{};
         currentTrack_ = Track{};
+        outgoingTrack_ = Track{};
         playFade_ = playFadeTarget_ = 1.0f;
         playFading_ = false;
         return;
     }
 
-    // A changed title/artist line moves to the outgoing set via beginTextBurn, which must run
-    // before buildCurrent rebuilds the new text; an unchanged line stays solid through the change.
-    titleChanged_ = (t.title != currentTrack_.title);
-    artistChanged_ = (t.artist != currentTrack_.artist);
-    beginTextBurn(titleChanged_, artistChanged_);
-    outgoingTrack_ = currentTrack_;
-    outgoingAccent_ = albumAccent_;  outgoingHasAccent_ = hasAlbumAccent_;
-    outgoingWashDim_ = washDim_;
-    outgoingHadAlbum_ = artWait_.reserved;
-    sameCover_ = !t.artPng.empty() && t.artPng == outgoingTrack_.artPng;
+    // A changed line moves to its outgoing slot before buildCurrent lays the new text. An
+    // unchanged line stays solid through the change. A line or cover still fading in from the
+    // interrupted change counts as changed even when its content matches, so it fades out from
+    // its current opacity instead of snapping to solid.
+    for (Line l : {Line::Title, Line::Artist}) {
+        const bool fadingIn = transitioning && outgoing(l).changed;
+        outgoing(l) = {};
+        if (fadingIn || lineText(t, l) != lineText(currentTrack_, l)) latchOutgoingLine(l);
+    }
+    const bool hadTrack = currentTrack_.valid;
+    coverChanged_ = (transitioning && coverChanged_) || t.artPng != currentTrack_.artPng;
+    fadeOutFrom_ = incomingFade;
 
-    // Hand the outgoing wash over so the new song's wash fades in over it. An identical cover skips
-    // the handoff and stays bound: draw never samples outgoingAlbum_ when sameCover_, and
-    // re-decoding would blank the cover until the async result lands.
+    // Latch the outgoing fill before the incoming cover decode can replace albumAccent_.
+    outgoingTrack_ = currentTrack_;
+    outgoingAccent_ = albumAccent_;
+    outgoingHasAccent_ = hasAlbumAccent_;
+    outgoingHadAlbum_ = artWait_.reserved;
+    outgoingWashDim_ = washDim_;
+
+    // A different cover moves to outgoingAlbum_ so it can fade out; album_ is cleared so the
+    // incoming decode does not overwrite the outgoing GPU image. Identical bytes stay bound.
     deferDestroyTexture(outgoingAlbum_);
-    if (!sameCover_) {
+    if (coverChanged_) {
         outgoingAlbum_ = album_;
         album_ = Texture{};
         hasAlbumAccent_ = false;
     }
 
-    // The cross-dissolve runs only on a song-to-song change; a first song reached from a blank
+    // The text fade runs only on a song-to-song change; a first song reached from a blank
     // card appears instantly. transitionArmed_ latches transitionStart_ on the next draw frame.
-    if (outgoingTrack_.valid) {
+    if (hadTrack) {
         state_ = PlaybackState::Transitioning;
         transitionArmed_ = true;
     } else {
@@ -408,35 +464,27 @@ void Renderer::setTrack(const Track& t) {
     seekGliding_ = false;
     playOffset_ = 0.0;
 
-    // The new song's bar starts at its own play state; a fade from the prior song is dropped.
+    // Incoming play/pause mix starts at the new song; the outgoing fill uses outgoingTrack_.playing.
     playFade_ = playFadeTarget_ = t.playing ? 1.0f : 0.0f;
     playFading_ = false;
 
-    buildCurrent(t);
+    buildCurrent(t, coverChanged_ && !t.artPng.empty());
     currentTrack_ = t;
 }
 
 void Renderer::refreshArt(const Track& t) {
-    // A late cover for a song buffered behind a running dissolve updates the pending song so the
-    // promotion rebuilds with it. A cover for the song on screen falls through and rebuilds in
-    // place: mid-dissolve the running incoming-cover fade carries it in.
-    if (state_ == PlaybackState::Transitioning && t.identity() != currentTrack_.identity()) {
-        pendingTrack_.track = t;
-        pendingTrack_.queued = true;
-        return;
-    }
-    // A cover replacing one held on screen mid-dissolve joins the running crossfade as its outgoing
-    // side; drawing the replacement outside the handoff would show it at full opacity mid-fade.
-    if (state_ == PlaybackState::Transitioning && sameCover_ && album_.valid && !outgoingAlbum_.valid) {
+    // Late art for a song that is not the incoming one is stale (already skipped). Applying it
+    // would fade in the previous cover.
+    if (t.identity() != currentTrack_.identity()) return;
+    // A cover replacing one held on screen mid-fade joins the running cover fade as its outgoing
+    // side only when there is no song-change cover already fading out.
+    if (state_ == PlaybackState::Transitioning && album_.valid && !outgoingAlbum_.valid) {
         outgoingAlbum_ = album_;
         album_ = Texture{};
         outgoingWashDim_ = washDim_;
-        sameCover_ = false;
+        coverChanged_ = true;
         hasAlbumAccent_ = false;
     }
-    // A still-valid album_ stays on screen until the replacement decode lands (swapped in draw), so
-    // the card never blanks for the decode's duration.
-    titleGlyphs_.clear();  artistGlyphs_.clear();
     buildCurrent(t, true);
     currentTrack_ = t;
 }
@@ -498,9 +546,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
                 destroyTexture(album_);
                 hasAlbumAccent_ = false;
                 artWait_.reserved = false;
-                titleGlyphs_.clear();
-                artistGlyphs_.clear();
-                for (Marquee& m : mq_) { auto burn = m.burn; m = Marquee{}; m.burn = burn; }
+                for (Marquee& m : mq_) m = Marquee{};
                 layoutText(currentTrack_);
             }
         }
@@ -522,49 +568,33 @@ void Renderer::draw(const Track& t, double nowSteady) {
     for (Marquee& m : mq_)
         if (m.armed) { m.start = nowSteady; m.armed = false; }
 
-    // A finished cross-dissolve releases the outgoing song, then promotes the pending song (a
-    // change requested mid-dissolve) into its own fresh dissolve. setTrack runs the real rotation
-    // here because state_ is Active; the re-armed transition's start is latched on this same frame
-    // so the parameter block below renders its dt=0 start.
+    // A finished fade releases the outgoing letters and cover. Incoming was already the latest
+    // song (a mid-fade skip retargets in place rather than queuing a second fade).
     if (state_ == PlaybackState::Transitioning && nowSteady - transitionStart_ >= TRANSITION_SEC) {
         state_ = PlaybackState::Active;
-        // Safe to free the outgoing wash: the fence wait above ordered the last frame to sample it,
-        // and this frame will not reference it (the handoff draws only while state_ is Transitioning).
         destroyTexture(outgoingAlbum_);
-        outgoingTitleGlyphs_.clear();
-        outgoingArtistGlyphs_.clear();
-        if (pendingTrack_.queued) {
-            Track next = std::move(pendingTrack_.track);
-            pendingTrack_.queued = false;
-            if (next.identity() != currentTrack_.identity())  setTrack(next);
-            else if (next.artPng != currentTrack_.artPng)     refreshArt(next);
-        }
-        if (transitionArmed_) { transitionStart_ = nowSteady; transitionArmed_ = false; }
-        for (Marquee& m : mq_)
-            if (m.armed) { m.start = nowSteady; m.armed = false; }
+        for (OutgoingLine& o : outgoing_) o = {};
+        outgoingTrack_ = Track{};
     }
 
-    // Song-change cross-dissolve parameters. The text runs in two sequential halves: the outgoing
-    // text burns over the first TEXT_DISSOLVE_SEC, then the incoming text materializes over the
-    // second, so the new text appears only once the old has fully burned. The defaults draw the
-    // incoming card solid with no transition.
-    float fillIn = 1.0f, dissolve = 0.0f, oldTextDissolve = 0.0f, newTextDissolve = 0.0f;
+    // Song-change text fade: outgoing opacity over the first TEXT_FADE_SEC, then incoming over
+    // the second. Defaults draw the incoming text solid with no transition.
+    float fadeOut = 0.0f, fadeIn = 1.0f;
     if (state_ == PlaybackState::Transitioning) {
         double dt = nowSteady - transitionStart_;
-        float p = static_cast<float>(dt / TRANSITION_SEC);
-        float s = p * p * (3.0f - 2.0f * p);
-        fillIn = s;
-        dissolve = s;
-        oldTextDissolve = static_cast<float>(std::clamp(dt / TEXT_DISSOLVE_SEC, 0.0, 1.0)) * DISSOLVE_END;
-        newTextDissolve = (1.0f - static_cast<float>(std::clamp((dt - TEXT_DISSOLVE_SEC) / TEXT_DISSOLVE_SEC, 0.0, 1.0))) * DISSOLVE_END;
+        if (dt < TEXT_FADE_SEC) {
+            fadeOut = fadeOutFrom_ * (1.0f - static_cast<float>(dt / TEXT_FADE_SEC));
+            fadeIn = 0.0f;
+        } else {
+            fadeOut = 0.0f;
+            fadeIn = static_cast<float>(std::clamp((dt - TEXT_FADE_SEC) / TEXT_FADE_SEC, 0.0, 1.0));
+        }
     }
 
     const bool transitioning = state_ == PlaybackState::Transitioning;
-    const float blurIn = fillIn;
 
-    // The bar, playhead, tip light, and play/pause mix read the on-screen song. During a buffered
-    // transition the draw argument t is the pending song (not yet shown); reading it would drive
-    // the visible card's bar from a song whose title and cover are not on screen.
+    // Playhead smoothing reads the incoming song. t is the latest poll of that song; currentTrack_
+    // is used when identity does not match so a stale poll cannot drive the fill.
     const Track& onScreen = (t.valid && t.identity() == currentTrack_.identity()) ? t : currentTrack_;
 
     // Smoothed playhead, shared by the progress fill and the tip light. A jump beyond the expected
@@ -614,49 +644,43 @@ void Renderer::draw(const Track& t, double nowSteady) {
     // Ortho view looks down -z; a far point on that axis gives the fragment shader a uniform view
     // vector for the specular term.
     cam.camPos = {0.0f, 0.0f, 100.0f, 0.0f};
-    // params.y carries the card's world half-height so the fragment shader can normalize a glyph
-    // fragment's height into the text-disintegration front's 0..1 gradient.
+    // params.y is the card's world half-height, used to map card-plane Y into wash-shadow UV.
     cam.params = {static_cast<float>(WIN_W) / static_cast<float>(WIN_H), CARD_HALF_H, 0.0f, 0.0f};
 
     const bool drawCard = transitioning ||
                           (t.valid && (!titleGlyphs_.empty() || !artistGlyphs_.empty() || artWait_.reserved));
-    const RGBA accent = hasAlbumAccent_ ? albumAccent_ : ACCENT;
 
-    // Point light at the playhead x on the bar's row, coloured like the fill. The incoming light
-    // scales by fillIn; during a song change the outgoing playhead drives a second light scaling by
-    // (1 - fillIn), so the two pools cross-fade.
-    cam.tipLight  = {0.0f, 0.0f, 0.0f, 0.0f};
-    cam.tipColor  = {0.0f, 0.0f, 0.0f, 0.0f};
-    cam.tipLight2 = {0.0f, 0.0f, 0.0f, 0.0f};
-    cam.tipColor2 = {0.0f, 0.0f, 0.0f, 0.0f};
-    auto placeTip = [&](vec4& lightSlot, vec4& colorSlot, const Track& tk, bool hasAlbum,
-                        RGBA c, double live, float intensity) {
-        if (intensity <= 0.0f || tk.duration <= 0.0) return;
-        BarGeometry bar = barGeometry(hasAlbum);
-        float frac = static_cast<float>(std::clamp(live / tk.duration, 0.0, 1.0));
-        float tipXw = bar.leftXw + (bar.rightXw - bar.leftXw) * frac;
-        lightSlot = {tipXw, bar.cyW, TIP_LIGHT_Z, TIP_LIGHT_RANGE};
-        colorSlot = {c.r, c.g, c.b, intensity};
-    };
-    if (drawCard && onScreen.valid) {
-        float intensity = TIP_LIGHT_INTENSITY * std::lerp(PAUSED_TIP_SCALE, 1.0f, playMix) * fillIn;
-        placeTip(cam.tipLight, cam.tipColor, onScreen, artWait_.reserved, mix(PAUSED_FG, accent, playMix),
-                 curLive, intensity);
+    // Fill, tip light, and groove follow the same sequential fade as the text: outgoing playhead
+    // and accent through fade-out, incoming only once fade-in starts. The incoming cover's accent
+    // must not recolour the still-visible outgoing fill.
+    const bool outgoingBar = transitioning && fadeOut > 0.0f && outgoingTrack_.valid;
+    const Track& barTrack = outgoingBar ? outgoingTrack_ : onScreen;
+    const bool barHasAlbum = outgoingBar ? outgoingHadAlbum_ : artWait_.reserved;
+    const float barFade = transitioning ? (outgoingBar ? fadeOut : fadeIn) : 1.0f;
+    const RGBA barColor = outgoingBar
+        ? (outgoingTrack_.playing ? (outgoingHasAccent_ ? outgoingAccent_ : ACCENT) : PAUSED_FG)
+        : mix(PAUSED_FG, hasAlbumAccent_ ? albumAccent_ : ACCENT, playMix);
+    const double barLive = outgoingBar
+        ? (outgoingTrack_.playing ? outgoingTrack_.position + (nowSteady - outgoingTrack_.posBase)
+                                  : outgoingTrack_.position)
+        : curLive;
+
+    // Point light at the playhead x on the bar's row, coloured like the fill.
+    cam.tipLight = {0.0f, 0.0f, 0.0f, 0.0f};
+    cam.tipColor = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (drawCard && barTrack.valid && barTrack.duration > 0.0 && barFade > 0.0f) {
+        float playScale = outgoingBar
+            ? (outgoingTrack_.playing ? 1.0f : PAUSED_TIP_SCALE)
+            : std::lerp(PAUSED_TIP_SCALE, 1.0f, playMix);
+        float intensity = TIP_LIGHT_INTENSITY * playScale * barFade;
+        if (intensity > 0.0f) {
+            BarGeometry bar = barGeometry(barHasAlbum);
+            float frac = static_cast<float>(std::clamp(barLive / barTrack.duration, 0.0, 1.0));
+            float tipXw = bar.leftXw + (bar.rightXw - bar.leftXw) * frac;
+            cam.tipLight = {tipXw, bar.cyW, TIP_LIGHT_Z, TIP_LIGHT_RANGE};
+            cam.tipColor = {barColor.r, barColor.g, barColor.b, intensity};
+        }
     }
-    if (transitioning && outgoingTrack_.valid) {
-        double outLive = outgoingTrack_.playing ? outgoingTrack_.position + (nowSteady - outgoingTrack_.posBase)
-                                            : outgoingTrack_.position;
-        RGBA c = outgoingTrack_.playing ? (outgoingHasAccent_ ? outgoingAccent_ : ACCENT) : PAUSED_FG;
-        // A live incoming song has no playhead light to crossfade in, so fade the outgoing pool
-        // with the old-text burn, not over the full transition, else it lights the new title.
-        float outFade = (onScreen.valid && onScreen.live) ? (1.0f - oldTextDissolve / DISSOLVE_END) : (1.0f - fillIn);
-        float intensity = TIP_LIGHT_INTENSITY * (outgoingTrack_.playing ? 1.0f : PAUSED_TIP_SCALE) * outFade;
-        placeTip(cam.tipLight2, cam.tipColor2, outgoingTrack_, outgoingHadAlbum_, c, outLive, intensity);
-    }
-    // The incoming tip's cast shadow is gated to the new title's own materialization so the streak
-    // appears only once the geometry it shadows is the incoming title, not the outgoing one still
-    // burning over the first half.
-    cam.tipShadow = {1.0f - newTextDissolve / DISSOLVE_END, 1.0f, 0.0f, 0.0f};
     std::memcpy(camUboMapped_, &cam, sizeof(cam));
 
     // Collect the scene on the CPU first so the occluders can be projected into the wash-shadow
@@ -665,37 +689,34 @@ void Renderer::draw(const Track& t, double nowSteady) {
     auto addCard = [&](const Track& tk, Texture& album) {
         const mat4 washQuad = quadModel(0, 0, WIN_W, WIN_H, Z_CARD, 0.0f);
         const mat4 coverQuad = quadModel(0, 0, WIN_H, WIN_H, Z_ALBUM, 0.0f);
-        // An unchanged cover (same album) is held static; only a different cover crossfades. The
-        // incoming side animates on every such dissolve, even from a coverless song, so a cover
-        // never lands at full opacity mid-fade.
-        const bool coverFade = transitioning && !sameCover_;
-        const bool coverHandoff = coverFade && outgoingAlbum_.valid;
-
-        // Drawn first so the incoming wash composites over it under LESS_OR_EQUAL at the shared
-        // Z_CARD; a coverless outgoing song contributes its flat card background instead.
-        if (coverHandoff)
-            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {1, 1, 1, 1}, .fade = 1.0f, .mode = MeshMode::Wash, .occluder = false, .tex = outgoingAlbum_.dset, .washDim = outgoingWashDim_});
-        else if (coverFade)
-            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {CARD_BG.r, CARD_BG.g, CARD_BG.b, 1.0f}, .fade = 1.0f, .mode = MeshMode::Lit, .occluder = false, .tex = white_.dset});
-        if (album.valid)
-            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {1, 1, 1, 1}, .fade = coverFade ? blurIn : 1.0f, .mode = MeshMode::Wash, .occluder = false, .tex = album.dset, .washDim = washDim_});
-        else
-            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {CARD_BG.r, CARD_BG.g, CARD_BG.b, 1.0f}, .fade = blurIn, .mode = MeshMode::Lit, .occluder = false, .tex = white_.dset});
-        // The outgoing cover clears over the first half and the incoming over the second, so the
-        // two coplanar quads never blend into a double image.
-        if (coverHandoff) {
-            float outFade = album.valid ? (1.0f - oldTextDissolve / DISSOLVE_END) : (1.0f - blurIn);
+        auto addBg = [&]() {
+            items.push_back({.mesh = &unitQuad_, .model = washQuad,
+                             .color = {CARD_BG.r, CARD_BG.g, CARD_BG.b, 1.0f}, .fade = 1.0f,
+                             .mode = MeshMode::Lit, .occluder = false, .tex = white_.dset});
+        };
+        auto addArt = [&](Texture& tex, float fade, float dim) {
+            if (fade <= 0.0f || !tex.valid) return;
+            items.push_back({.mesh = &unitQuad_, .model = washQuad, .color = {1, 1, 1, 1},
+                             .fade = fade, .mode = MeshMode::Wash, .occluder = false, .tex = tex.dset, .washDim = dim});
             items.push_back({.mesh = &unitQuad_, .model = coverQuad, .color = {1, 1, 1, 1},
-                             .fade = outFade, .mode = MeshMode::Flat, .occluder = false, .tex = outgoingAlbum_.dset});
+                             .fade = fade, .mode = MeshMode::Flat, .occluder = false, .tex = tex.dset});
+        };
+        const bool coverFade = transitioning && coverChanged_;
+        if (coverFade) {
+            // Solid card under the fading wash so the chroma key never shows through.
+            addBg();
+            addArt(outgoingAlbum_, fadeOut, outgoingWashDim_);
+            addArt(album, fadeIn, washDim_);
+        } else if (album.valid) {
+            addArt(album, 1.0f, washDim_);
+        } else {
+            addBg();
         }
-        if (album.valid)
-            items.push_back({.mesh = &unitQuad_, .model = coverQuad, .color = {1, 1, 1, 1},
-                             .fade = coverFade ? (1.0f - newTextDissolve / DISSOLVE_END) : 1.0f, .mode = MeshMode::Flat, .occluder = false, .tex = album.dset});
         if (tk.duration > 0.0 || tk.live) {
             // Unfilled groove: the rod's centre is lifted one radius off Z_BAR so it sits in front
-            // of the card rather than sinking into it. Sized by the reserved cover slot so the bar
-            // doesn't jump when a decoding cover lands.
-            BarGeometry bar = barGeometry(artWait_.reserved);
+            // of the card rather than sinking into it. Sized with the fill currently on screen so
+            // the rod does not jump to the incoming cover inset during fade-out.
+            BarGeometry bar = barGeometry(barHasAlbum);
             items.push_back({.mesh = &barRod_,
                              .model = translate({bar.leftXw, bar.cyW, Z_BAR + bar.radius}) *
                                       scale({bar.rightXw - bar.leftXw, bar.radius, bar.radius}),
@@ -704,25 +725,23 @@ void Renderer::draw(const Track& t, double nowSteady) {
         }
     };
 
-    // Letters cast projected shadows. A dissolving letter stays in the occluder set: the shadow
-    // fragment discards against the same death field so the cast shadow erodes with the glyph.
-    // A marquee glyph sets clipColumn so the wash-shadow pass scissors it to the column.
-    auto addGlyphs = [&](const std::vector<GlyphInstance>& glyphs, float dissolve, vec4 ember,
+    // Letters cast projected shadows. A fading letter stays in the occluder set: the shadow pass
+    // writes (1 - fade) so the cast shadow fades with the glyph. A marquee glyph sets clipColumn
+    // so the wash-shadow pass scissors it to the column.
+    auto addGlyphs = [&](const std::vector<GlyphInstance>& glyphs, float fade,
                          float penShift = 0.0f, bool clip = false) {
         for (const GlyphInstance& gi : glyphs) {
             float sx = gi.pos.x + penShift;
             items.push_back({.mesh = gi.mesh,
                              .model = translate({sx, gi.pos.y, gi.pos.z}) * scale(gi.scale),
-                             .color = gi.color, .fade = 1.0f, .mode = MeshMode::Lit, .occluder = true, .tex = white_.dset,
-                             .dissolve = dissolve, .dissolveColor = ember, .clipColumn = clip});
+                             .color = gi.color, .fade = fade, .mode = MeshMode::Lit, .occluder = true, .tex = white_.dset,
+                             .clipColumn = clip});
         }
     };
 
     // Neon progress fill: the played span from the bar's left edge to the playhead, one Z step
-    // nearer than the groove. Built apart from the card so a song change can cross-dissolve two
-    // fills over the single groove.
-    auto addFill = [&](const Track& tk, bool hasAlbum, RGBA fillColor, float fade, float barDissolve, double playhead,
-                       float zBias) {
+    // nearer than the groove.
+    auto addFill = [&](const Track& tk, bool hasAlbum, RGBA fillColor, float fade, double playhead) {
         if (fade <= 0.0f || (tk.duration <= 0.0 && !tk.live)) return;
         double frac = tk.live ? 1.0 : std::clamp(std::min(playhead, tk.duration) / tk.duration, 0.0, 1.0);
         if (frac <= 0.0) return;
@@ -730,56 +749,41 @@ void Renderer::draw(const Track& t, double nowSteady) {
         float tipXw = bar.leftXw + static_cast<float>((bar.rightXw - bar.leftXw) * frac);
         float fillLen = std::max(tipXw - bar.leftXw, bar.radius);
         items.push_back({.mesh = &barRod_,
-                         .model = translate({bar.leftXw, bar.cyW, Z_BAR_FILL + bar.radius + zBias}) *
+                         .model = translate({bar.leftXw, bar.cyW, Z_BAR_FILL + bar.radius}) *
                                   scale({fillLen, bar.radius, bar.radius}),
                          .color = {fillColor.r, fillColor.g, fillColor.b, 1.0f}, .fade = fade, .mode = MeshMode::Bar, .occluder = false,
-                         .tex = white_.dset, .tess = true, .tessLevel = 24.0f, .barDissolve = barDissolve,
+                         .tex = white_.dset, .tess = true, .tessLevel = 24.0f,
                          .barLen = fillLen, .liveBar = tk.live ? 1.0f : 0.0f});
     };
 
     if (drawCard) {
-        vec4 inEmber{accent.r, accent.g, accent.b, 1.0f};
-        addCard(onScreen, album_);
+        addCard(barTrack, album_);
         // A scrolling line draws two copies a period apart so one enters from the right as the
-        // other leaves left, both column-clipped; a line that fits draws one unclipped copy.
-        auto drawLine = [&](const std::vector<GlyphInstance>& glyphs, const Marquee& m, float diss) {
-            if (!m.active) { addGlyphs(glyphs, diss, inEmber); return; }
+        // other leaves left, both column-clipped; a line that fits draws one unclipped copy. The
+        // live line scrolls with the clock, the outgoing copy holds its frozen offset.
+        auto drawLine = [&](const std::vector<GlyphInstance>& glyphs, bool scrolling, float shift, float period, float fade) {
+            if (fade <= 0.0f) return;
+            if (!scrolling) { addGlyphs(glyphs, fade); return; }
+            addGlyphs(glyphs, fade, -shift, true);
+            addGlyphs(glyphs, fade, period - shift, true);
+        };
+        for (Line l : {Line::Title, Line::Artist}) {
+            const Marquee& m = mq(l);
+            const OutgoingLine& o = outgoing(l);
+            const bool fading = transitioning && o.changed;
             double scroll = std::max(0.0, (nowSteady - m.start) - MARQUEE_HOLD_SEC) * m.speed;
             double period = m.width + m.gap;
-            double sMod = period > 0.0 ? std::fmod(scroll, period) : 0.0;
-            addGlyphs(glyphs, diss, inEmber, -static_cast<float>(sMod), true);
-            addGlyphs(glyphs, diss, inEmber, static_cast<float>(period - sMod), true);
-        };
-        drawLine(titleGlyphs_, mq(Line::Title), titleChanged_ ? newTextDissolve : 0.0f);
-        drawLine(artistGlyphs_, mq(Line::Artist), artistChanged_ ? newTextDissolve : 0.0f);
-        if (transitioning) {
-            vec4 outEmber{outgoingEmberAccent_.r, outgoingEmberAccent_.g, outgoingEmberAccent_.b, 1.0f};
-            // A burning line that was scrolling holds its frozen offset; both wrapped copies stay
-            // clipped so whatever spanned the column keeps spanning it while it burns.
-            auto drawOutgoing = [&](const std::vector<GlyphInstance>& glyphs, const Marquee& m) {
-                if (!m.burn.on) { addGlyphs(glyphs, oldTextDissolve, outEmber); return; }
-                addGlyphs(glyphs, oldTextDissolve, outEmber, -m.burn.shift, true);
-                addGlyphs(glyphs, oldTextDissolve, outEmber, m.burn.period - m.burn.shift, true);
-            };
-            drawOutgoing(outgoingTitleGlyphs_, mq(Line::Title));
-            drawOutgoing(outgoingArtistGlyphs_, mq(Line::Artist));
+            float shift = period > 0.0 ? static_cast<float>(std::fmod(scroll, period)) : 0.0f;
+            drawLine(glyphs(l), m.active, shift, static_cast<float>(period), fading ? fadeIn : 1.0f);
+            if (fading) drawLine(o.glyphs, o.scrolling, o.shift, o.period, fadeOut);
         }
-        // outgoing fill on the bar plane; incoming lifted by Z_FILL_OVER to own the shared span
-        if (transitioning && outgoingTrack_.valid)
-            addFill(outgoingTrack_, outgoingHadAlbum_,
-                    outgoingTrack_.playing ? (outgoingHasAccent_ ? outgoingAccent_ : ACCENT) : PAUSED_FG, 1.0f, dissolve,
-                    outgoingTrack_.playing ? outgoingTrack_.position + (nowSteady - outgoingTrack_.posBase) : outgoingTrack_.position,
-                    0.0f);
-        addFill(onScreen, artWait_.reserved, mix(PAUSED_FG, accent, playMix), fillIn, 0.0f, curLive, transitioning ? Z_FILL_OVER : 0.0f);
+        addFill(barTrack, barHasAlbum, barColor, barFade, barLive);
     }
 
-    // Refresh the displayed song's snapshot each frame so the next change dissolves the bar from
-    // its real last-shown position (a seek does not update the setTrack snapshot). Guarded to the
-    // song on screen: during a buffered transition the poll carries the pending song, and adopting
-    // it would defeat the promotion's identity check. artPng is preserved, not advanced: only
-    // setTrack/refreshArt rebuild album_, so currentTrack_.artPng must keep mirroring the bytes
-    // album_ was built from, or the promotion's same-song late-cover check compares already-equal
-    // values and skips the rebuild.
+    // Refresh the incoming song's snapshot each frame so the next change starts from its real
+    // last-shown position (a seek does not update the setTrack snapshot). artPng is preserved:
+    // only setTrack/refreshArt rebuild album_, so currentTrack_.artPng must keep mirroring the
+    // bytes album_ was built from.
     if (t.valid && t.identity() == currentTrack_.identity()) {
         std::vector<uint8_t> builtArt = std::move(currentTrack_.artPng);
         currentTrack_ = t;
@@ -855,7 +859,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
             VkPipeline bound = VK_NULL_HANDLE;
             vkCmdSetScissor(cb, 0, 1, &ssc);
             for (const DrawItem& it : items) {
-                if (!it.occluder || it.mesh->indexCount == 0) continue;
+                if (!it.occluder || it.mesh->indexCount == 0 || it.fade <= 0.0f) continue;
                 if (it.rod && !includeRod) continue;
                 if (it.clipColumn != colScissor) {
                     vkCmdSetScissor(cb, 0, 1, it.clipColumn ? &sColSc : &ssc);
@@ -868,9 +872,9 @@ void Renderer::draw(const Track& t, double nowSteady) {
                 }
                 MeshPush pc{};
                 pc.model = it.model;
+                pc.fade = it.fade;
                 pc.mode = lightMode;
                 pc.tessLevel = it.tessLevel;
-                pc.dissolve = it.dissolve;
                 vkCmdPushConstants(cb, shadowPipeLayout_, pushStages, 0, sizeof(pc), &pc);
                 VkDeviceSize off = 0;
                 vkCmdBindVertexBuffers(cb, 0, 1, &it.mesh->vbo, &off);
@@ -879,8 +883,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
             }
         };
         drawOcc(0, true);
-        if (cam.tipColor.w > 0.0f && cam.tipShadow.x > 0.0f) drawOcc(1, false);
-        if (cam.tipColor2.w > 0.0f && cam.tipShadow.y > 0.0f) drawOcc(2, false);
+        if (cam.tipColor.w > 0.0f) drawOcc(1, false);
         vkCmdEndRenderPass(cb);
 
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, washShadowPipeline_);
@@ -900,8 +903,8 @@ void Renderer::draw(const Track& t, double nowSteady) {
     }
 
     // With a card up the frame clears to black; with no card it clears to the chroma key so OBS
-    // keys it out. The card-to-key swap is a hard cut: the text disintegration burns over the card
-    // and never reveals the key.
+    // keys it out. The card-to-key swap is a hard cut: the text fade runs over the card and never
+    // reveals the key.
     std::array<VkClearValue, 3> clears{};
     clears[0].color = drawCard ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 1.0f}}
                                : VkClearColorValue{{KEY_COLOR.r, KEY_COLOR.g, KEY_COLOR.b, 1.0f}};
@@ -937,7 +940,7 @@ void Renderer::draw(const Track& t, double nowSteady) {
     VkPipeline boundPipe = VK_NULL_HANDLE;
     for (const DrawItem& it : items) {
         const Mesh& m = *it.mesh;
-        if (m.indexCount == 0) continue;
+        if (m.indexCount == 0 || it.fade <= 0.0f) continue;
         if (it.clipColumn != colScissor) {
             vkCmdSetScissor(cb, 0, 1, it.clipColumn ? &colSc : &sc);
             colScissor = it.clipColumn;
@@ -958,11 +961,8 @@ void Renderer::draw(const Track& t, double nowSteady) {
         pc.mode = std::to_underlying(it.mode);
         pc.barLen = it.barLen;
         pc.tessLevel = it.tessLevel;
-        pc.barDissolve = it.barDissolve;
-        pc.dissolve = it.dissolve;
         pc.liveBar = it.liveBar;
         pc.washDim = it.washDim;
-        pc.dissolveColor = it.dissolveColor;
         vkCmdPushConstants(cb, meshPipeLayout_, pushStages, 0, sizeof(pc), &pc);
         VkDeviceSize off = 0;
         vkCmdBindVertexBuffers(cb, 0, 1, &m.vbo, &off);

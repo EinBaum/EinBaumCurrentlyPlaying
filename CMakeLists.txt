@@ -13,8 +13,8 @@ endif()
 set(SRC ${CMAKE_SOURCE_DIR}/src)
 
 # --- Shaders: compile to embeddable SPIR-V C arrays (the binary carries no .spv files) ---------------
-# Stages target Vulkan 1.2. -I resolves shadow_common.glsl (camera UBO, dissolve field, wash
-# projection). Output goes to ${CMAKE_BINARY_DIR}/shaders/*.inl, which the renderer includes as
+# Stages target Vulkan 1.2. -I resolves shadow_common.glsl (camera UBO, wash projection).
+# Output goes to ${CMAKE_BINARY_DIR}/shaders/*.inl, which the renderer includes as
 # "shaders/<name>.inl" (so ${CMAKE_BINARY_DIR} is on the include path below).
 find_program(GLSLC glslc REQUIRED)
 set(SHADER_DIR ${SRC}/shaders)
@@ -67,6 +67,7 @@ add_library(core STATIC
     ${SRC}/core/image.cpp
     ${SRC}/core/renderer.cpp
     ${SRC}/core/renderer_vk.cpp
+    ${SRC}/core/simulate.cpp
     ${SRC}/core/track_text.cpp
 )
 add_dependencies(core shaders)

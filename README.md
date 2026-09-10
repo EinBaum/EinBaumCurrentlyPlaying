@@ -15,8 +15,9 @@ Add a Window/Game Capture source, then a Chroma Key filter, Key Color green (`#0
 
 ```
 EinBaumCurrentlyPlaying
-EinBaumCurrentlyPlaying --debug # shows fps counter
-EinBaumCurrentlyPlaying --http  # enables HTTP API
+EinBaumCurrentlyPlaying --debug     # shows fps counter
+EinBaumCurrentlyPlaying --http      # enables HTTP API
+EinBaumCurrentlyPlaying --simulate  # 10 fake songs, one per second, then exit
 ```
 
 ## API

@@ -1,7 +1,7 @@
 #version 460
 
 // Half-resolution wash shadow term. One invocation per half-res texel reconstructs the card-plane
-// world point it covers, PCF-filters the rasterized hard occlusion (R = key, G/B = tip lights),
+// world point it covers, PCF-filters the rasterized occlusion (R = key, G = tip light),
 // and stores visibilities. The M_WASH fragment path then bilinearly upsamples this. The shadow
 // term is low-frequency (soft penumbra, smooth tip pools), so the visible gradient survives the
 // 2x downsample.
@@ -25,14 +25,13 @@ vec3 filterOcc(vec2 world, float radius) {
     return acc * 0.125;
 }
 
-// A tip light casts no shadow when it is off, the receiver is out of its range, or its gate is closed
-// while the light is still appearing; the fragment path early-outs identically there, so the stored
-// value is unused but kept at fully-lit. `gate` (0..1) fades the filtered streak in.
-float tipVisibility(vec3 P, vec4 light, vec4 color, float gate, float shVis) {
-    if (color.a <= 0.0 || gate <= 0.0) return 1.0;
+// A tip light casts no shadow when it is off or the receiver is out of its range; the fragment path
+// early-outs identically there, so the stored value is unused but kept at fully-lit.
+float tipVisibility(vec3 P, vec4 light, vec4 color, float shVis) {
+    if (color.a <= 0.0) return 1.0;
     vec3 toL = light.xyz - P;
     if (length(toL) >= light.w) return 1.0;
-    return mix(1.0, shVis, gate);
+    return shVis;
 }
 
 void main() {
@@ -48,7 +47,6 @@ void main() {
 
     vec3 occ = filterOcc(P.xy, SHADOW_PCF_RADIUS);
     float keyVis = 1.0 - KEY_SHADOW_HARDNESS * (1.0 - occ.r);
-    float tip1 = tipVisibility(P, cam.tipLight,  cam.tipColor,  cam.tipShadow.x, occ.g);
-    float tip2 = tipVisibility(P, cam.tipLight2, cam.tipColor2, cam.tipShadow.y, occ.b);
-    imageStore(outShadow, gid, vec4(keyVis, tip1, tip2, 1.0));
+    float tip1 = tipVisibility(P, cam.tipLight, cam.tipColor, occ.g);
+    imageStore(outShadow, gid, vec4(keyVis, tip1, 1.0, 1.0));
 }

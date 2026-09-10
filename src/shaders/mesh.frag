@@ -5,10 +5,10 @@ layout(location = 1) in vec2 vUV;
 layout(location = 2) in vec3 vWorld;
 
 layout(set = 0, binding = 0) uniform sampler2D tex;
-// Half-res key/tip shadow visibilities from wash_shadow.comp: R = key, G = tip light 1, B = tip light 2.
+// Half-res key/tip shadow visibilities from wash_shadow.comp: R = key, G = tip light.
 layout(set = 1, binding = 1) uniform sampler2D washShadow;
 
-#include "shadow_common.glsl"   // Camera (set 1, binding 0), death field, key/tip light constants
+#include "shadow_common.glsl"   // Camera (set 1, binding 0), key/tip light constants
 
 layout(push_constant) uniform PC {
     mat4 model;
@@ -17,11 +17,8 @@ layout(push_constant) uniform PC {
     int mode;
     float barLen;          // M_BAR: the fill rod's current world length
     float tessLevel;
-    float barDissolve;     // >0 activates: progress (0..1) of the bar fill's dissolve-out
-    float dissolve;        // >0 activates: text-disintegration progress (0..1)
     float liveBar;         // >0 = live-stream fill: uniform glow, no white-hot tip
     float washDim;         // M_WASH: per-cover darkening factor for the blurred background
-    vec4 dissolveColor;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -96,36 +93,23 @@ void main() {
 
     vec3 N = normalize(vNormal);
 
-    // Text disintegration. Each fragment's death threshold comes from the value-noise field plus a
-    // small upward height bias (rise: 0 at the card's bottom edge, 1 at the top) so the burn drifts
-    // bottom to top. A fragment is discarded once pc.dissolve passes its death threshold; the thin
-    // band still ahead of the front glows.
-    vec3 emberAdd = vec3(0.0);
-    if (pc.dissolve > 0.0) {
-        float edge = dissolveDeath(vWorld) - pc.dissolve;
-        if (edge <= 0.0) discard;
-        float ember = 1.0 - clamp(edge / 0.13, 0.0, 1.0);
-        emberAdd = mix(pc.dissolveColor.rgb, vec3(1.0), ember * ember) * ember * 2.0;
-    }
-
     if (pc.mode == M_WASH) {
         vec3 w = blurWash(vUV, pc.washDim);
         // The wash quad covers the full window at z=0, so vUV is the screen UV: it indexes the half-res
-        // shadow buffer at the same world point wash_shadow.comp filtered. R = key, G/B = the tip lights.
+        // shadow buffer at the same world point wash_shadow.comp filtered. R = key, G = the tip light.
         vec3 vis = texture(washShadow, vUV).rgb;
         vec3 Vw = normalize(cam.camPos.xyz - vWorld);
-        float occ1, occ2;
-        vec3 glow  = tipLight(vWorld, N, Vw, vec3(0.8), true, vis.g, cam.tipLight,  cam.tipColor,  occ1);
-        glow      += tipLight(vWorld, N, Vw, vec3(0.8), true, vis.b, cam.tipLight2, cam.tipColor2, occ2);
+        float occ;
+        vec3 glow = tipLight(vWorld, N, Vw, vec3(0.8), true, vis.g, cam.tipLight, cam.tipColor, occ);
         // Key letter shadows stay put. The playhead still lights the wash additively (`glow`); mixing
         // the key term toward 1 with tip fill made those shadows crawl and punch out as the bar moved.
         w *= mix(1.0, vis.r, KEY_SHADOW_STRENGTH);
-        w *= min(occ1, occ2);
+        w *= occ;
         w += glow;
         // Triangular-PDF dither (two hashes summed, recentred) breaks 8-bit banding in the dark wash
         // gradient; the lit solids carry no smooth gradient to band.
         float dz = (ditherHash(gl_FragCoord.xy) + ditherHash(gl_FragCoord.xy + 13.37) - 1.0) * (0.5 / 255.0);
-        outColor = vec4(w + dz + emberAdd, pc.fade);
+        outColor = vec4(w + dz, pc.fade);
         return;
     }
 
@@ -152,17 +136,7 @@ void main() {
         // TIP_WHITE < 1 keeps an accent tint at the peak, not full white
         const float TIP_WHITE = 0.7;
         emit += mix(accent, vec3(1.0), tip * TIP_WHITE) * tip;
-        emit += emberAdd;
-        float alpha = pc.fade;
-        if (pc.barDissolve > 0.0) {
-            // A transparency front sweeps from the bar's start (localx 0) toward the playhead (localx 1)
-            // as barDissolve runs 0 -> 1, so the start clears first and the tip holds longest. BAND is
-            // the gradient width.
-            const float BAND = 0.4;
-            float front = mix(-BAND, 1.0, pc.barDissolve);
-            alpha = smoothstep(front, front + BAND, localx);
-        }
-        outColor = vec4(body + emit, alpha);
+        outColor = vec4(body + emit, pc.fade);
         return;
     }
 
@@ -177,11 +151,10 @@ void main() {
     float ambient = 0.36;
 
     // ambient + 0.60 * diff stays at or below 1 so a lit face never brightens past its albedo and clips
-    // to white; the specular is a small additive term on top. The tip lights pass shadowed = false: the
+    // to white; the specular is a small additive term on top. The tip light passes shadowed = false: the
     // letter faces are frontmost, so nothing can fall between them and a light in front of them.
     vec3 lit = albedo * (ambient + 0.60 * diff) + vec3(spec * 0.08);
     float washOcc;   // written by tipLight but unused here (shadowed = false)
-    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight,  cam.tipColor,  washOcc);
-    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight2, cam.tipColor2, washOcc);
-    outColor = vec4(lit + emberAdd, tx.a * pc.fade);
+    lit += tipLight(vWorld, N, V, albedo, false, 1.0, cam.tipLight, cam.tipColor, washOcc);
+    outColor = vec4(lit, tx.a * pc.fade);
 }

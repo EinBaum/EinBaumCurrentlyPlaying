@@ -4,13 +4,16 @@
 #include "core/http_api.hpp"
 #include "core/media.hpp"
 #include "core/renderer.hpp"
+#include "core/simulate.hpp"
 #include "platform/platform.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -29,6 +32,13 @@ constexpr double KEEP_LAST_SEC = 10.0;
 [[nodiscard]] double steadySeconds() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+void adoptTrack(Track t) {
+    g_lastIdentity = t.identity();
+    g_lastArt = t.artPng;
+    g_renderer.setTrack(t);
+    g_track = std::move(t);
 }
 
 // Returns true when the on-screen state changed and a redraw is due now.
@@ -71,12 +81,15 @@ constexpr double KEEP_LAST_SEC = 10.0;
 
 }  // namespace
 
-int runApp(PlatformWindow& window, bool debug, bool http) {
+int runApp(PlatformWindow& window, bool debug, bool http, bool simulate) {
     g_renderer.init(window);
     g_renderer.setShowFps(debug);
     g_inited = true;
-    g_poller.start();
-    if (http) g_api.start(g_poller);
+    SongSwitchSim sim;
+    if (!simulate) {
+        g_poller.start();
+        if (http) g_api.start(g_poller);
+    }
 
     window.show();
 
@@ -117,7 +130,16 @@ int runApp(PlatformWindow& window, bool debug, bool http) {
     while (running) {
         if (!window.pumpEvents()) { running = false; break; }
 
-        bool changed = pollMedia();
+        bool changed = false;
+        if (simulate) {
+            if (auto t = sim.poll(steadySeconds())) {
+                adoptTrack(std::move(*t));
+                changed = true;
+            }
+            if (sim.done()) { running = false; break; }
+        } else {
+            changed = pollMedia();
+        }
         if (changed) {
             if (g_track.valid && !g_lastArt.empty()) window.setTaskbarArt(g_lastArt);
             else window.clearTaskbarArt();
@@ -144,11 +166,15 @@ int runApp(PlatformWindow& window, bool debug, bool http) {
         } else {
             timeoutMs = static_cast<int>(IDLE_POLL_SEC * 1000.0);
         }
+        if (simulate)
+            timeoutMs = std::min(timeoutMs, sim.waitMs(steadySeconds()));
         window.waitEvents(timeoutMs);
     }
     window.clearTaskbarArt();
-    g_api.stop();
-    g_poller.stop();
+    if (!simulate) {
+        g_api.stop();
+        g_poller.stop();
+    }
     g_renderer.shutdown();
     return 0;
 }

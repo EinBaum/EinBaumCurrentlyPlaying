@@ -20,15 +20,12 @@ struct CameraUBO {
     vec4 params;     // x = card aspect (W/H); y = card world half-height; zw unused (std140 padding)
     vec4 tipLight;   // progress-bar tip point light: xyz = world position, w = range (0 = off)
     vec4 tipColor;   // tip light: rgb = colour, a = intensity
-    vec4 tipLight2;  // second tip point light: the outgoing playhead during a song change
-    vec4 tipColor2;  // second tip light: rgb = colour, a = intensity (0 = off)
-    vec4 tipShadow;  // x = tipLight cast-shadow gate, y = tipLight2 gate (0 = casts no shadow)
 };
 
-// Push constant for the mesh and shadow pipelines (128 B). Matches the PC blocks in
+// Push constant for the mesh and shadow pipelines. Matches the PC blocks in
 // mesh.vert/mesh.tesc/mesh.tese/mesh.frag and the shadow shaders; earlier stages declare a
 // shorter prefix of this block, which the shared layout permits. In the shadow pass, `mode`
-// selects the light (0 = key, 1/2 = tip) rather than MeshMode.
+// selects the light (0 = key, 1 = tip) rather than MeshMode.
 struct MeshPush {
     mat4 model;
     vec4 color;
@@ -36,9 +33,6 @@ struct MeshPush {
     int32_t mode;      // MeshMode
     float barLen;      // Bar: the fill rod's world length, sizing the white-hot tip in fixed world units
     float tessLevel;   // tessellation subdivision factor (ignored by the non-tessellated pipeline)
-    float barDissolve; // >0 = progress (0..1) of the bar fill's left-to-right dissolve-out
-    float dissolve;    // >0 = text-disintegration progress (0..1)
     float liveBar;     // Bar: >0 = live-stream fill — uniform glow, no playhead tip
-    float washDim;     // Wash: per-cover darkening factor (also pads dissolveColor to offset 112)
-    vec4 dissolveColor;
+    float washDim;     // Wash: per-cover darkening factor
 };

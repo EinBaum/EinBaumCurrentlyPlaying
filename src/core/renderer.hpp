@@ -59,20 +59,24 @@ enum class Line : uint8_t { Title, Artist, Count };
 struct Marquee {
     bool active = false;
     bool armed = false;
-    // Outgoing burning copy: it holds at the scroll offset the burn caught it at, column-clipped.
-    struct Burn {
-        bool on = false;
-        float shift = 0.0f;   // frozen scroll offset, world units
-        float period = 0.0f;  // width + gap at freeze time, world units
-    } burn;
     double start = 0.0;    // steady-clock seconds the scroll is measured from
     float width = 0.0f;    // laid line width, world units
     float gap = 0.0f;      // blank gap before the wrapped repeat, world units
     float speed = 0.0f;    // world units per second
 };
 
+// The copy of a text line that fades out during a song change. A scrolling line holds at the
+// offset the change caught it at, drawn as two wrapped column-clipped copies like the live line.
+struct OutgoingLine {
+    bool changed = false;  // incoming text differs: this copy fades out, then the new line fades in
+    std::vector<GlyphInstance> glyphs;
+    bool scrolling = false;
+    float shift = 0.0f;    // frozen scroll offset, world units
+    float period = 0.0f;   // width + gap at freeze time, world units
+};
+
 // Top-level on-screen lifecycle. Pause and seek modulate Active rather than being states here;
-// Transitioning is the song-to-song cross-dissolve, mutually exclusive with NoMedia.
+// Transitioning is the song-to-song text fade, mutually exclusive with NoMedia.
 enum class PlaybackState : uint8_t { NoMedia, Active, Transitioning };
 
 class Renderer {
@@ -138,8 +142,8 @@ private:
     void* camUboMapped_ = nullptr;
 
     // Wash-plane shadows, half the swapchain extent, rebuilt on resize. Occluders are projected
-    // onto the card into washOcc* (hard 0/1 per light channel, MIN blend). wash_shadow.comp
-    // PCF-filters that into washShadow* (R = key, G/B = tip lights), which stays in GENERAL
+    // onto the card into washOcc* (occlusion 0..1 per light channel, MIN blend). wash_shadow.comp
+    // PCF-filters that into washShadow* (R = key, G = tip light), which stays in GENERAL
     // (compute writes, fragment samples). washOccPass_ outlives the swapchain; the framebuffer
     // is rebuilt with the images.
     VkPipeline washShadowPipeline_ = VK_NULL_HANDLE;
@@ -172,6 +176,12 @@ private:
     std::map<std::pair<const void*, uint32_t>, float> advanceCache_;
 
     Texture white_, album_;
+    Texture outgoingAlbum_;             // cover fading out during a song change
+    float outgoingWashDim_ = 1.0f;
+    RGBA outgoingAccent_{};             // fill colour of the song fading out
+    bool outgoingHasAccent_ = false;
+    bool outgoingHadAlbum_ = false;     // outgoing fill rod is inset past the cover
+
     std::unique_ptr<FontFace> fontTitle_, fontTitleSmall_, fontArtist_, fontFps_;
 
     std::vector<GlyphInstance> titleGlyphs_, artistGlyphs_;
@@ -197,25 +207,19 @@ private:
     // next fence wait.
     std::vector<StagedUpload> inFlightStagings_;
 
-    // Cross-dissolve song slots. outgoing* is the song dissolving away; currentTrack_ the song
-    // dissolving in and then shown; pendingTrack_ the latest change requested mid-dissolve
-    // (overwritten by each further change, so a fast-skip burst collapses to the final song) and
-    // promoted to its own fresh dissolve once the running one completes.
-    RGBA outgoingAccent_{};
-    bool outgoingHasAccent_ = false;
-    float outgoingWashDim_ = 1.0f;      // keeps the outgoing cover's retained wash calibrated
-    bool outgoingHadAlbum_ = false;     // a cover shifts the fill rod's left edge right past the art
-    bool sameCover_ = false;            // incoming art is byte-identical to the outgoing: skip the cover handoff
-    Texture outgoingAlbum_;
+    // currentTrack_ is the song fading in (or shown). outgoingTrack_ is the song whose playhead
+    // and fill colour still show during fade-out. A skip mid-fade retargets currentTrack_ in place
+    // so the incoming cover and text are the latest song, not one already skipped past.
     Track currentTrack_;
     Track outgoingTrack_;
-    struct PendingTrack { Track track; bool queued = false; };
-    PendingTrack pendingTrack_;
     PlaybackState state_ = PlaybackState::NoMedia;
     // transitionStart_ is sampled from the draw clock; transitionArmed_ defers that latch to the
     // first draw frame.
     double transitionStart_ = 0.0;
     bool transitionArmed_ = false;
+    // Opacity the outgoing song fades out from. 1 after a normal change. Below 1 when a skip
+    // caught the previous incoming song partway through its fade-in and made it the outgoing one.
+    float fadeOutFrom_ = 1.0f;
 
     // Seek glide. playOffset_ holds (shown - true) seconds and eases to zero over SEEK_GLIDE_SEC;
     // lastTrueLive_/lastNowSteady_ hold the prior frame's playhead and clock so the next frame can
@@ -235,13 +239,10 @@ private:
     double playFadeStart_ = 0.0;
     bool playFading_ = false;
 
-    // Outgoing title/artist moved here by beginTextBurn on a song change; they disintegrate over
-    // the transition timer. A line whose text is unchanged is left out and does not animate:
-    // titleChanged_/artistChanged_ gate both its burn-out and its materialize-in.
-    std::vector<GlyphInstance> outgoingTitleGlyphs_, outgoingArtistGlyphs_;
-    RGBA outgoingEmberAccent_{};   // ember tint of the burn
-    bool titleChanged_ = false;
-    bool artistChanged_ = false;
+    // Per-line outgoing copy, latched by latchOutgoingLine on a song change. A line whose text is
+    // unchanged is not latched and stays solid through the change.
+    std::array<OutgoingLine, static_cast<size_t>(Line::Count)> outgoing_;
+    bool coverChanged_ = false;         // art bytes differ: fade the square and its wash
 
     // Both lines share one horizontal column (only baselines differ), so the scissor, wash band,
     // and cast-shadow clip are a single band whose edges live here, not per line.
@@ -250,6 +251,9 @@ private:
 
     [[nodiscard]] Marquee& mq(Line l) { return mq_[static_cast<size_t>(l)]; }
     [[nodiscard]] const Marquee& mq(Line l) const { return mq_[static_cast<size_t>(l)]; }
+    [[nodiscard]] OutgoingLine& outgoing(Line l) { return outgoing_[static_cast<size_t>(l)]; }
+    [[nodiscard]] std::vector<GlyphInstance>& glyphs(Line l) { return l == Line::Title ? titleGlyphs_ : artistGlyphs_; }
+    [[nodiscard]] static const std::wstring& lineText(const Track& t, Line l) { return l == Line::Title ? t.title : t.artist; }
 
     // Frame-rate readout: an exponential moving average of 1/frametime with a 0.25 s time constant.
     double fpsLastSteady_ = 0.0;
@@ -291,6 +295,7 @@ private:
     [[nodiscard]] float armLine(Marquee& m, float laidW, float colW, float emWorld, float maxX);
     void buildCurrent(const Track& t, bool redecode = false);
     void layoutText(const Track& t);
-    void beginTextBurn(bool burnTitle, bool burnArtist);
+    void latchOutgoingLine(Line l);
+    void retargetIncoming(const Track& t);
     float advancePlayPauseFade(bool playing, double nowSteady);
 };
