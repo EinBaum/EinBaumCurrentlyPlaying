@@ -265,9 +265,9 @@ void MediaPoller::stop() {
     }
 }
 
-uint64_t MediaPoller::latest(Track& out) {
+uint64_t MediaPoller::latest(Track& out, uint64_t since) {
     EnterCriticalSection(&impl_->cs_);
-    out = impl_->track_;
+    if (since != impl_->seq_) out = impl_->track_;
     uint64_t s = impl_->seq_;
     LeaveCriticalSection(&impl_->cs_);
     return s;

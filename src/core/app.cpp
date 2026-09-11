@@ -45,7 +45,7 @@ void adoptTrack(Track t) {
 [[nodiscard]] bool pollMedia() {
     if (!g_inited) return false;
     Track t;
-    uint64_t seq = g_poller.latest(t);
+    uint64_t seq = g_poller.latest(t, g_lastSeq);
     if (seq == g_lastSeq) return false;
     g_lastSeq = seq;
     if (t.valid) {
@@ -60,7 +60,7 @@ void adoptTrack(Track t) {
             g_lastArt = t.artPng;
             g_renderer.refreshArt(t);
         }
-        g_track = t;
+        g_track = std::move(t);
         return true;
     }
     if (g_track.valid) {

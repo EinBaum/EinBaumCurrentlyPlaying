@@ -322,8 +322,8 @@ void MediaPoller::stop() {
     if (impl_->thread_.joinable()) impl_->thread_.join();
 }
 
-uint64_t MediaPoller::latest(Track& out) {
+uint64_t MediaPoller::latest(Track& out, uint64_t since) {
     std::lock_guard<std::mutex> lk(impl_->mtx_);
-    out = impl_->track_;
+    if (since != impl_->seq_) out = impl_->track_;
     return impl_->seq_;
 }

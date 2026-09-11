@@ -784,10 +784,13 @@ void Renderer::draw(const Track& t, double nowSteady) {
     // last-shown position (a seek does not update the setTrack snapshot). artPng is preserved:
     // only setTrack/refreshArt rebuild album_, so currentTrack_.artPng must keep mirroring the
     // bytes album_ was built from.
-    if (t.valid && t.identity() == currentTrack_.identity()) {
-        std::vector<uint8_t> builtArt = std::move(currentTrack_.artPng);
-        currentTrack_ = t;
-        currentTrack_.artPng = std::move(builtArt);
+    if (t.valid && t.title == currentTrack_.title && t.artist == currentTrack_.artist) {
+        currentTrack_.valid = t.valid;
+        currentTrack_.playing = t.playing;
+        currentTrack_.live = t.live;
+        currentTrack_.duration = t.duration;
+        currentTrack_.position = t.position;
+        currentTrack_.posBase = t.posBase;
     }
 
     if (showFps_) {
@@ -824,8 +827,12 @@ void Renderer::draw(const Track& t, double nowSteady) {
         VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
         VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    // Only a card frame samples the wash shadow, so project occluders and filter only then.
-    if (drawCard) {
+    // Only album washes sample this texture. Coverless cards and transition frames with no
+    // visible wash need neither the occluder draws nor the compute filter.
+    const bool drawWash = std::any_of(items.begin(), items.end(), [](const DrawItem& it) {
+        return it.mode == MeshMode::Wash;
+    });
+    if (drawWash) {
         VkClearValue occClear{};
         occClear.color = VkClearColorValue{{1.0f, 1.0f, 1.0f, 1.0f}};
         VkRenderPassBeginInfo sbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
